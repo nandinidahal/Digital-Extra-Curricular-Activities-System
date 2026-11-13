@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import { useAuth } from "../../context/AuthContext";
 import { dashboardPath } from "../../utils/format";
 
+
 // Section links scroll the home page. BASE_URL keeps them working under /xca/
 const home = import.meta.env.BASE_URL;
 const links = [
@@ -42,7 +43,7 @@ export default function Header() {
           ) : (
             <>
               <Link to="/login" className="text-sm font-semibold text-pine-700">Log in</Link>
-              <Link to="/register" className="btn-primary">Create account</Link>
+              <Link to="/CreateAccount" className="btn-primary">Create account</Link>
             </>
           )}
         </div>
@@ -75,7 +76,7 @@ export default function Header() {
               ) : (
                 <>
                   <Link to="/login" onClick={() => setOpen(false)} className="btn-outline flex-1">Log in</Link>
-                  <Link to="/register" onClick={() => setOpen(false)} className="btn-primary flex-1">Create account</Link>
+                  <Link to="/CreateAccount" onClick={() => setOpen(false)} className="btn-primary flex-1">Create account</Link>
                 </>
               )}
             </div>
