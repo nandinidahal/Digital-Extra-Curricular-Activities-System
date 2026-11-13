@@ -2,8 +2,8 @@ import { Link } from "react-router-dom";
 
 export default function HeroSection() {
   return (
-    <section className="bg-pine-700 text-white">
-      <div className="container-page grid items-center gap-12 py-16 md:grid-cols-5 md:py-24">
+    <section className="bg-pine-700 text-white ">
+      <div className="container-page grid items-center gap-12 py-16 md:grid-cols-5 md:py-24 ">
         <div className="md:col-span-3">
           <h1 className="text-4xl font-bold leading-[1.1] sm:text-5xl lg:text-6xl">
             Discover it. Join it. Get recognised for it.

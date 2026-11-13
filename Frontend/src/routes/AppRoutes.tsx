@@ -3,7 +3,10 @@ import MainLayout from "../components/layout/MainLayout";
 import ProtectedRoute from "./ProtectedRoute";
 import HomePage from "../pages/public/HomePage";
 import LoginPage from "../pages/public/LoginPage";
+// import  CreateAccount  from "../pages/public/CreateAccount";
 import PlaceholderPage from "../pages/PlaceholderPage";
+import CreateAccount from "../pages/public/CreateAccount";
+import ActivityDetail from "../components/common/ActivityDetail";
 
 // Pages that are not built yet use PlaceholderPage. Replace them one by one.
 const page = (title: string) => <PlaceholderPage title={title} />;
@@ -15,9 +18,11 @@ export default function AppRoutes() {
         {/* Public */}
         <Route path="/" element={<HomePage />} />
         <Route path="/activities" element={page("All activities")} />
-        <Route path="/activities/:id" element={page("Activity details")} />
+        {/* <Route path="/activities/:id" element={page("Activity details")} /> */}
         <Route path="/login" element={<LoginPage />} />
-        <Route path="/register" element={page("Create your account")} />
+        <Route path="/CreateAccount" element={<CreateAccount />} />
+        <Route path="/activities/:id" element={<ActivityDetail />} />
+        {/* <Route path="/register" element={page("Create your account")} /> */}
         <Route path="/verify/:code" element={page("Verify a certificate")} />
 
         {/* Student */}
