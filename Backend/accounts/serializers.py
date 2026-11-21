@@ -101,6 +101,7 @@ class ResetPasswordSerializer(serializers.Serializer):
             raise serializers.ValidationError({"confirm_password": ["Passwords do not match."]})
         return attrs
 
+
 class ChangePasswordSerializer(serializers.Serializer):
     current_password = serializers.CharField(
         write_only=True,

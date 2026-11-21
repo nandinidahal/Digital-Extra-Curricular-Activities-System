@@ -10,23 +10,27 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/5.2/ref/settings/
 """
 
-from pathlib import Path
+import os
 from datetime import timedelta
+from pathlib import Path
+
+from dotenv import load_dotenv
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(BASE_DIR / '.env')  # real values live in .env (never committed); see .env.example
 
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-zp(kimzi^xc0c%t2$#6-nt0i7#@9l!b*w37pnhqk79f9_0e@jv'
+SECRET_KEY = os.getenv('SECRET_KEY', 'django-insecure-dev-only-change-me')
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = os.getenv('DEBUG', 'True').lower() in ('1', 'true', 'yes')
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = [h for h in os.getenv('ALLOWED_HOSTS', '').split(',') if h]
 
 
 # Application definition
@@ -46,6 +50,11 @@ INSTALLED_APPS = [
 
     'accounts',
     'announcements',
+    'achievements',
+    'profiles',
+    'friends',
+    'messaging',
+    'social',
 ]
 
 MIDDLEWARE = [
@@ -90,11 +99,11 @@ WSGI_APPLICATION = 'config.wsgi.application'
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.postgresql',
-        'NAME': 'digital_extra_db',
-        'USER': 'user1',
-        'PASSWORD': 'password',
-        'HOST': '127.0.0.1',
-        'PORT': '5432',
+        'NAME': os.getenv('DB_NAME', 'digital_extra_db'),
+        'USER': os.getenv('DB_USER', 'user1'),
+        'PASSWORD': os.getenv('DB_PASSWORD', 'password'),
+        'HOST': os.getenv('DB_HOST', '127.0.0.1'),
+        'PORT': os.getenv('DB_PORT', '5432'),
     }
 }
 AUTH_USER_MODEL = 'accounts.User'
@@ -115,6 +124,9 @@ AUTH_PASSWORD_VALIDATORS = [
     },
     {
         'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator',
+    },
+    {
+        'NAME': 'accounts.validators.PasswordComplexityValidator',
     },
 ]
 
@@ -157,6 +169,9 @@ REST_FRAMEWORK = {
     'DEFAULT_THROTTLE_RATES': {
         'auth': '30/min',
         'otp': '10/min',
+        'social_write': '60/min',      # posts, comments, likes, shares
+        'friend_requests': '30/hour',
+        'message_send': '60/min',
     },
 }
 

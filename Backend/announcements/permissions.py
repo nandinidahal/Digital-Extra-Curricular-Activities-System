@@ -1,28 +1,22 @@
 from rest_framework.permissions import SAFE_METHODS, BasePermission
 
 
-class IsCoordinatorOrAdmin(BasePermission):
-    message = "Only coordinators and administrators can do this."
+def can_curate(user):
+    """Who may set the featured / important flags.
 
-    def has_permission(self, request, view):
-        u = request.user
-        return bool(u and u.is_authenticated and u.is_coordinator)
+    Uses the existing role system when present (``accounts.User.is_coordinator`` covers
+    coordinators and admins); if a user model has no such property nobody can curate.
+    """
+    return bool(user and user.is_authenticated and getattr(user, "is_coordinator", False))
 
 
-class IsOwnerOrAdmin(BasePermission):
-    """Object level: owners edit their own announcements, admins edit all."""
-    message = "You can only modify announcements you created."
+class IsAnnouncementOwnerOrReadOnly(BasePermission):
+    """Object level. Read: any authenticated student (visibility is enforced by the queryset,
+    so other people's drafts are a 404 before this runs). Write/delete: the author only -> 403."""
+
+    message = "You can only modify your own announcements."
 
     def has_object_permission(self, request, view, obj):
-        u = request.user
-        return bool(u.is_authenticated and (u.is_platform_admin or obj.published_by_id == u.id))
-
-
-class IsAdminOrReadOnly(BasePermission):
-    message = "Only administrators can manage categories."
-
-    def has_permission(self, request, view):
         if request.method in SAFE_METHODS:
             return True
-        u = request.user
-        return bool(u and u.is_authenticated and u.is_platform_admin)
+        return obj.published_by_id == request.user.id
