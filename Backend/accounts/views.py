@@ -1,3 +1,4 @@
+from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.db.models import Q
@@ -10,10 +11,13 @@ from rest_framework.views import APIView
 from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenRefreshView
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError as DjangoValidationError
 
 from . import services
 from .models import OTPPurpose
 from .serializers import (
+    ChangePasswordSerializer,
     EmailOnlySerializer,
     LoginSerializer,
     LogoutSerializer,
@@ -116,7 +120,7 @@ class LogoutView(APIView):
         s.is_valid(raise_exception=True)
         try:
             token = RefreshToken(s.validated_data["refresh"])
-            if token.get("user_id") != str(request.user.pk) and token.get("user_id") != request.user.pk:
+            if str(token.get("user_id")) != str(request.user.pk):
                 raise TokenError("Token does not belong to this user.")
             token.blacklist()
         except TokenError:
@@ -145,7 +149,7 @@ class VerifyResetOTPView(OTPView):
         return Response({
             "message": "Code verified. You may now set a new password.",
             "reset_token": token,
-            "expires_in": services.settings.RESET_TOKEN_EXPIRY_SECONDS,
+            "expires_in": settings.RESET_TOKEN_EXPIRY_SECONDS,
         })
 
 
@@ -157,8 +161,6 @@ class ResetPasswordView(OTPView):
         if user is None:
             raise ValidationError({"reset_token": ["Invalid or expired reset authorization."]})
 
-        from django.contrib.auth.password_validation import validate_password
-        from django.core.exceptions import ValidationError as DjangoValidationError
         try:
             validate_password(s.validated_data["new_password"], user=user)
         except DjangoValidationError as exc:
@@ -177,3 +179,35 @@ class MeView(APIView):
 
     def get(self, request):
         return Response(UserSerializer(request.user).data)
+
+
+class ChangePasswordView(APIView):
+    """POST /api/auth/change-password/ - logged-in user changes their own password.
+
+    Every other session is revoked (refresh tokens blacklisted, token_version bumped) and a fresh
+    token pair is returned so the current client stays logged in.
+    """
+
+    permission_classes = [IsAuthenticated]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "auth"
+
+    def post(self, request):
+        s = ChangePasswordSerializer(data=request.data)
+        s.is_valid(raise_exception=True)
+        user = request.user
+        if not user.check_password(s.validated_data["current_password"]):
+            raise ValidationError({"current_password": ["Current password is incorrect."]})
+        new_password = s.validated_data["new_password"]
+        if user.check_password(new_password):
+            raise ValidationError({"new_password": ["New password must be different from the current one."]})
+        try:
+            validate_password(new_password, user=user)
+        except DjangoValidationError as exc:
+            raise ValidationError({"new_password": list(exc.messages)})
+
+        with transaction.atomic():
+            user.set_password(new_password)
+            user.save(update_fields=["password"])
+            services.revoke_all_sessions(user)
+        return Response({"message": "Password changed successfully.", **services.tokens_for_user(user)})

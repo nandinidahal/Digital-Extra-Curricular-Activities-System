@@ -10,8 +10,10 @@ staticfiles/
 venv/
 .venv/
 
-.env
 .env.local
+.env
+.env.*
+!.env.example
 
 node_modules/
 dist/
