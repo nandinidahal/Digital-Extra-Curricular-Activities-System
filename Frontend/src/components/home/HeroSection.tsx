@@ -15,7 +15,7 @@ export default function HeroSection() {
           <div className="mt-8 flex flex-wrap gap-3">
             <a href={`${import.meta.env.BASE_URL}#activities`} className="btn-accent">Explore activities</a>
             <Link to="/login" className="btn border border-white/40 text-white hover:bg-white/10">Log in</Link>
-             <Link to="/dashboard-view" className="btn border border-white/40 text-white hover:bg-white/10">Dahboard Ui</Link>
+             {/* <Link to="/dashboard-view" className="btn border border-white/40 text-white hover:bg-white/10">Dahboard Ui</Link> */}
           </div>
         </div>
 
