@@ -1,0 +1,13 @@
+{% autoescape off %}Hello {{ full_name }},
+
+{{ title }}
+
+{{ message }}
+{% if action_link %}
+Open DEAS: {{ action_link }}
+{% endif %}
+You receive this e-mail because of your DEAS notification settings.{% if preferences_link %}
+Change them here: {{ preferences_link }}{% endif %}
+
+- The {{ app_name }} team
+{% endautoescape %}
