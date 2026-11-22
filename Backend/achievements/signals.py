@@ -1,29 +1,12 @@
-import logging
-
-from django.db import transaction
 from django.db.models.signals import post_delete
 from django.dispatch import receiver
 
-from .models import AchievementDocument
+from common.files import delete_file_on_commit
 
-logger = logging.getLogger(__name__)
+from .models import AchievementEvidence
 
 
-@receiver(post_delete, sender=AchievementDocument)
-def delete_stored_file(sender, instance, **kwargs):
-    """Remove the stored file once the row deletion has committed.
-
-    Fires for every way a document can disappear: removed/replaced via the API, the
-    achievement or the owner being deleted (cascade), or deletion in the admin.
-    """
-    if not instance.file:
-        return
-    storage, name = instance.file.storage, instance.file.name
-
-    def _delete():
-        try:
-            storage.delete(name)
-        except Exception:  # never let clean-up break a request
-            logger.exception("Could not delete achievement file %s", name)
-
-    transaction.on_commit(_delete)
+@receiver(post_delete, sender=AchievementEvidence, dispatch_uid="achievements_evidence_file_cleanup")
+def delete_evidence_file(sender, instance, **kwargs):
+    """Private evidence files disappear after commit whenever their row does (incl. cascades)."""
+    delete_file_on_commit(instance.file)

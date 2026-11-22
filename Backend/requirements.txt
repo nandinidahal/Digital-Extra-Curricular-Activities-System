@@ -1,13 +1,14 @@
-asgiref==3.12.1
-Django==5.2.18
-django-cors-headers==4.9.0
-django-filter==26.2
-djangorestframework==3.18.3
-djangorestframework_simplejwt==5.5.1
-pillow==13.0.0
-psycopg==3.3.6
-psycopg-binary==3.3.6
-PyJWT==2.15.1
-python-dotenv==1.2.4
-sqlparse==0.6.0
-typing_extensions==4.16.0
+# Runtime dependencies. The Common, Social, Announcements, Achievements and Notifications modules
+# need no packages beyond these (Django, DRF, SimpleJWT, Channels, Pillow are already listed).
+Django>=5.2,<5.3
+djangorestframework>=3.15,<4.0
+djangorestframework-simplejwt>=5.3,<6.0
+django-cors-headers>=4.4,<5.0
+psycopg[binary]>=3.2,<4.0
+python-dotenv>=1.0,<2.0
+Pillow>=10.4,<14.0
+# ---- Messaging (real-time) ----
+channels>=4.1,<5.0
+channels-redis>=4.2,<5.0
+daphne>=4.1,<5.0
+redis>=5.0,<9.0

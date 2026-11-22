@@ -2,19 +2,26 @@ from django.urls import path
 
 from . import views
 
+app_name = "friends"
+
 urlpatterns = [
-    path("", views.FriendListView.as_view(), name="friends-list"),
-    path("suggestions/", views.SuggestionsView.as_view(), name="friends-suggestions"),
-    path("status/<int:user_id>/", views.FriendStatusView.as_view(), name="friends-status"),
-    path("mutual/<str:username>/", views.MutualFriendsView.as_view(), name="friends-mutual"),
-    path("requests/", views.SendRequestView.as_view(), name="friend-request-send"),
-    path("requests/incoming/", views.IncomingRequestsView.as_view(), name="friend-requests-incoming"),
-    path("requests/outgoing/", views.OutgoingRequestsView.as_view(), name="friend-requests-outgoing"),
-    path("requests/<int:request_id>/accept/", views.RequestActionView.as_view(action_name="accept"), name="friend-request-accept"),
-    path("requests/<int:request_id>/reject/", views.RequestActionView.as_view(action_name="reject"), name="friend-request-reject"),
-    path("requests/<int:request_id>/ignore/", views.RequestActionView.as_view(action_name="ignore"), name="friend-request-ignore"),
-    path("requests/<int:request_id>/cancel/", views.RequestActionView.as_view(action_name="cancel"), name="friend-request-cancel"),
-    path("blocks/", views.BlockListView.as_view(), name="blocks"),
-    path("blocks/<int:user_id>/", views.BlockDetailView.as_view(), name="block-detail"),
-    path("<int:user_id>/", views.FriendDetailView.as_view(), name="friend-detail"),
+    # Friend requests
+    path("requests/", views.SendFriendRequestView.as_view(), name="request-send"),
+    path("requests/received/", views.ReceivedRequestsView.as_view(), name="requests-received"),
+    path("requests/sent/", views.SentRequestsView.as_view(), name="requests-sent"),
+    path("requests/<uuid:request_id>/accept/", views.AcceptFriendRequestView.as_view(), name="request-accept"),
+    path("requests/<uuid:request_id>/reject/", views.RejectFriendRequestView.as_view(), name="request-reject"),
+    path("requests/<uuid:request_id>/cancel/", views.CancelFriendRequestView.as_view(), name="request-cancel"),
+    # Friendships
+    path("", views.FriendListView.as_view(), name="list"),
+    path("count/", views.FriendCountView.as_view(), name="count"),
+    path("status/<uuid:user_id>/", views.FriendStatusView.as_view(), name="status"),
+    path("mutual/<uuid:user_id>/", views.MutualFriendsView.as_view(), name="mutual"),
+    path("discover/", views.DiscoverUsersView.as_view(), name="discover"),
+    # Blocking
+    path("blocked/", views.BlockedListCreateView.as_view(), name="blocked"),
+    path("blocked/status/<uuid:user_id>/", views.BlockStatusView.as_view(), name="block-status"),
+    path("blocked/<uuid:user_id>/", views.BlockedDetailView.as_view(), name="unblock"),
+    # Must stay last among the <uuid> routes
+    path("<uuid:user_id>/", views.FriendDetailView.as_view(), name="remove"),
 ]

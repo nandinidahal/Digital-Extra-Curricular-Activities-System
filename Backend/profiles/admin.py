@@ -1,18 +1,13 @@
 from django.contrib import admin
 
-from .models import PendingEmailChange, UserProfile
+from .models import Profile
 
 
-@admin.register(UserProfile)
-class UserProfileAdmin(admin.ModelAdmin):
-    list_display = ("user", "profile_visibility", "email_visibility", "date_of_birth_visibility", "deactivated_at")
-    list_filter = ("profile_visibility", "email_visibility", "date_of_birth_visibility", "bio_visibility")
-    search_fields = ("user__username", "user__email", "user__full_name")
+@admin.register(Profile)
+class ProfileAdmin(admin.ModelAdmin):
+    list_display = ("user", "profile_visibility", "institution", "education_level", "date_created")
+    list_filter = ("profile_visibility", "education_level")
+    search_fields = ("user__username", "user__email", "user__full_name", "institution")
     raw_id_fields = ("user",)
-
-
-@admin.register(PendingEmailChange)
-class PendingEmailChangeAdmin(admin.ModelAdmin):
-    list_display = ("user", "new_email", "created_at", "expires_at", "attempts")
-    exclude = ("code_hash",)
-    raw_id_fields = ("user",)
+    readonly_fields = ("id", "date_created", "updated_at")
+    ordering = ("-date_created",)

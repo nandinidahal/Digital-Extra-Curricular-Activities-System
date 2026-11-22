@@ -1,11 +1,20 @@
-from django.conf import settings
-from django.db.models.signals import post_save
+from django.db import transaction
+from django.db.models.signals import post_delete
 from django.dispatch import receiver
 
-@receiver(post_save, sender="achievements.Achievement")
-def keep_post_private_with_achievement(sender, instance, created, **kwargs):
-    """A non-public achievement must never stay visible through its feed post."""
-    if created or instance.visibility == "public":
+from .models import PostMedia
+from .services import _delete_stored_file
+
+
+@receiver(post_delete, sender=PostMedia, dispatch_uid="social_cleanup_media_files")
+def delete_file_with_media(sender, instance, **kwargs):
+    """
+    Whenever a PostMedia row disappears (attachment removed, post deleted, user deleted,
+    cascade), its file is removed from storage after the transaction commits, so a rolled-back
+    delete never loses a file.
+    """
+    name = instance.image.name
+    if not name:
         return
-    from .models import Post  # local import: avoids loading models at import time
-    Post.objects.filter(achievement=instance).exclude(visibility="private").update(visibility="private")
+    storage = instance.image.storage
+    transaction.on_commit(lambda: _delete_stored_file(storage, name))

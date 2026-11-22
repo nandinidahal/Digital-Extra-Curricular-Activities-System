@@ -1,324 +1,369 @@
-from django.contrib.auth import get_user_model
+"""
+Serializers of the Social module.
+
+Input serializers are strict: unknown keys (author, author_id, user, is_deleted,
+like_count ...) are rejected with a 400 instead of being silently ignored, so a
+client can never believe it changed ownership or a counter.
+Output serializers list every field explicitly.
+"""
+from collections.abc import Mapping
+
+from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework import serializers
 
-from achievements.models import Achievement
-from achievements.models import Visibility as AchievementVisibility
-from announcements.models import Announcement, AnnouncementStatus
-from profiles.models import UserProfile
+from common.relationships import hidden_user_ids
+from common.serializers import user_card
 
-from .models import (CLIENT_POST_KINDS, Comment, Notification, NotificationType, Post,
-                     PostImage, PostKind, Visibility)
-from .validators import validate_image
-
-User = get_user_model()
-MAX_IMAGES_PER_POST = 10
-
-
-def _abs(request, f):
-    if not f:
-        return None
-    url = f.url
-    return request.build_absolute_uri(url) if request else url
+from .models import (
+    COMMENT_MAX_LENGTH,
+    POST_MAX_LENGTH,
+    REPORT_DESCRIPTION_MAX_LENGTH,
+    SHARE_CAPTION_MAX_LENGTH,
+    Comment,
+    ContentReport,
+    Post,
+    PostMedia,
+    PostShare,
+)
+from .validators import max_images_per_post, validate_post_image, validate_social_text
 
 
-class UserBriefSerializer(serializers.ModelSerializer):
-    """Avatar + name + username: what every card in the UI needs to link to a profile."""
-    avatar = serializers.SerializerMethodField()
-
-    class Meta:
-        model = User
-        fields = ("id", "username", "full_name", "avatar")
-        read_only_fields = fields
-
-    def get_avatar(self, obj):
-        profile = getattr(obj, "user_profile", None)  # callers select_related("user_profile")
-        return _abs(self.context.get("request"), profile.profile_picture if profile else None)
-
-
-# ---------------------------------------------------------------- profiles
-def _clean_tags(value, label):
-    if not isinstance(value, list):
-        raise serializers.ValidationError("Provide a list of strings.")
-    out, seen = [], set()
-    for item in value:
-        if not isinstance(item, str):
-            raise serializers.ValidationError("Provide a list of strings.")
-        item = " ".join(item.split()).lower()
-        if not item:
-            continue
-        if len(item) > 40:
-            raise serializers.ValidationError(f"Each {label} must be 40 characters or fewer.")
-        if item not in seen:
-            seen.add(item)
-            out.append(item)
-    if len(out) > 20:
-        raise serializers.ValidationError(f"At most 20 {label}s.")
-    return out
+# ---------------------------------------------------------------------------
+# Input
+# ---------------------------------------------------------------------------
+class StrictFieldsMixin:
+    def to_internal_value(self, data):
+        if not isinstance(data, Mapping):
+            raise serializers.ValidationError({"non_field_errors": ["Expected a JSON object."]})
+        writable = {name for name, field in self.fields.items() if not field.read_only}
+        errors = {key: ["This field cannot be set or changed here."] for key in data.keys() if key not in writable}
+        if errors:
+            raise serializers.ValidationError(errors)
+        return super().to_internal_value(data)
 
 
-class ProfileUpdateSerializer(serializers.ModelSerializer):
-    full_name = serializers.CharField(max_length=150, required=False)
-    # "avatar" is the API name; it is stored in UserProfile.profile_picture (one picture per user).
-    avatar = serializers.ImageField(source="profile_picture", required=False, allow_null=True,
-                                    validators=[validate_image])
-    cover_image = serializers.ImageField(required=False, allow_null=True, validators=[validate_image])
-    bio = serializers.CharField(max_length=300, required=False, allow_blank=True)
-    interests = serializers.JSONField(required=False)
-    skills = serializers.JSONField(required=False)
-
-    class Meta:
-        model = UserProfile
-        fields = ("full_name", "avatar", "cover_image", "bio", "institution", "department", "interests", "skills")
-
-    def validate_interests(self, v):
-        return _clean_tags(v, "interest")
-
-    def validate_skills(self, v):
-        return _clean_tags(v, "skill")
-
-    def update(self, instance, validated):
-        full_name = validated.pop("full_name", None)
-        if full_name is not None and full_name != instance.user.full_name:
-            instance.user.full_name = full_name.strip()
-            instance.user.save(update_fields=["full_name"])
-        return super().update(instance, validated)
+def _text_field(max_length, *, required=True, allow_blank=False):
+    return serializers.CharField(
+        max_length=max_length,
+        required=required,
+        allow_blank=allow_blank,
+        trim_whitespace=True,
+        validators=[validate_social_text],
+    )
 
 
-class ProfileSerializer(serializers.Serializer):
-    """Read-only profile page. Expects the view to pass precomputed stats in context['stats']."""
+class PostWriteSerializer(StrictFieldsMixin, serializers.Serializer):
+    """Create (JSON or multipart) and edit (partial) a post. New images go in the `images` field."""
 
-    def to_representation(self, user):
-        request = self.context.get("request")
-        profile = getattr(user, "user_profile", None)
-        stats = self.context["stats"]
-        return {
-            "id": user.pk,
-            "username": user.username,
-            "full_name": user.full_name,
-            "date_joined": user.date_joined,
-            "avatar": _abs(request, profile.profile_picture if profile else None),
-            "cover_image": _abs(request, profile.cover_image if profile else None),
-            "bio": profile.bio if profile else "",
-            "institution": profile.institution if profile else "",
-            "department": profile.department if profile else "",
-            "interests": (profile.interests if profile else []) or [],
-            "skills": (profile.skills if profile else []) or [],
-            **stats,
-        }
+    content = _text_field(POST_MAX_LENGTH, required=False, allow_blank=True)
+    post_type = serializers.ChoiceField(choices=Post.PostType.choices, required=False)
+    visibility = serializers.ChoiceField(choices=Post.Visibility.choices, required=False)
+    images = serializers.ListField(
+        child=serializers.FileField(allow_empty_file=False, use_url=False),
+        required=False,
+        allow_empty=True,
+    )
 
-
-# ---------------------------------------------------------------- posts
-class PostImageSerializer(serializers.ModelSerializer):
-    url = serializers.SerializerMethodField()
-
-    class Meta:
-        model = PostImage
-        fields = ("id", "url", "position")
-
-    def get_url(self, obj):
-        return _abs(self.context.get("request"), obj.image)
-
-
-class PostEmbedSerializer(serializers.ModelSerializer):
-    """The original post inside a share."""
-    author = UserBriefSerializer(read_only=True)
-    images = PostImageSerializer(many=True, read_only=True)
-
-    class Meta:
-        model = Post
-        fields = ("id", "author", "kind", "caption", "images", "created_at")
-
-
-class PostSerializer(serializers.ModelSerializer):
-    author = UserBriefSerializer(read_only=True)
-    images = PostImageSerializer(many=True, read_only=True)
-    achievement = serializers.SerializerMethodField()
-    announcement = serializers.SerializerMethodField()
-    shared_from = serializers.SerializerMethodField()
-    original_unavailable = serializers.SerializerMethodField()
-    liked_by_me = serializers.SerializerMethodField()
-    is_mine = serializers.SerializerMethodField()
-
-    class Meta:
-        model = Post
-        fields = ("id", "author", "kind", "caption", "visibility", "images", "achievement", "announcement",
-                  "shared_from", "original_unavailable", "like_count", "comment_count", "share_count",
-                  "liked_by_me", "is_mine", "is_edited", "created_at", "updated_at")
-
-    def get_achievement(self, obj):
-        a = obj.achievement
-        if a is None:
-            return None
-        return {"id": a.pk, "title": a.title, "achieved_on": a.achievement_date, "organization": a.issuing_organization}
-
-    def get_announcement(self, obj):
-        a = obj.announcement
-        return {"id": a.pk, "title": a.title} if a else None
-
-    def get_shared_from(self, obj):
-        if obj.shared_from_id and getattr(obj, "original_visible", False):
-            return PostEmbedSerializer(obj.shared_from, context=self.context).data
-        return None
-
-    def get_original_unavailable(self, obj):
-        return bool(obj.kind == PostKind.SHARE and not getattr(obj, "original_visible", False))
-
-    def get_liked_by_me(self, obj):
-        if hasattr(obj, "liked_by_me"):
-            return obj.liked_by_me
-        return False
-
-    def get_is_mine(self, obj):
-        request = self.context.get("request")
-        return bool(request and request.user.is_authenticated and obj.author_id == request.user.pk)
-
-
-class PostWriteSerializer(serializers.Serializer):
-    caption = serializers.CharField(max_length=5000, required=False, allow_blank=True)
-    visibility = serializers.ChoiceField(choices=Visibility.choices, required=False)
-    kind = serializers.ChoiceField(choices=CLIENT_POST_KINDS, required=False)
-    achievement_id = serializers.IntegerField(required=False)
-    announcement_id = serializers.IntegerField(required=False)
-    images = serializers.ListField(child=serializers.ImageField(validators=[validate_image]), required=False,
-                                   max_length=MAX_IMAGES_PER_POST)
-    remove_image_ids = serializers.ListField(child=serializers.IntegerField(), required=False)
+    def validate_images(self, files):
+        limit = max_images_per_post()
+        if len(files) > limit:
+            raise serializers.ValidationError(f"A post can have at most {limit} images.")
+        checked = []
+        for index, upload in enumerate(files, start=1):
+            try:
+                image_format = validate_post_image(upload)
+            except DjangoValidationError as exc:
+                prefix = f"Image {index}: " if len(files) > 1 else ""
+                raise serializers.ValidationError(prefix + " ".join(exc.messages))
+            checked.append((upload, image_format))
+        return checked
 
     def validate(self, attrs):
-        request = self.context["request"]
-        user = request.user
-        post = self.instance  # None on create
-
-        if post is not None and post.kind == PostKind.SHARE:
-            if attrs.get("images") or attrs.get("remove_image_ids") or "kind" in attrs \
-                    or "achievement_id" in attrs or "announcement_id" in attrs:
-                raise serializers.ValidationError("A shared post only supports a caption and visibility.")
-            return attrs
-
-        if post is not None:
-            for locked in ("kind", "achievement_id", "announcement_id"):
-                if locked in attrs:
-                    raise serializers.ValidationError({locked: ["This cannot be changed after posting."]})
-            existing = post.images.count()
-            remove = set(attrs.get("remove_image_ids", []))
-            if remove - set(post.images.values_list("pk", flat=True)):
-                raise serializers.ValidationError({"remove_image_ids": ["Unknown image id."]})
-            if existing - len(remove) + len(attrs.get("images", [])) > MAX_IMAGES_PER_POST:
-                raise serializers.ValidationError({"images": [f"At most {MAX_IMAGES_PER_POST} images per post."]})
-            vis = attrs.get("visibility", post.visibility)
-            if post.achievement_id and post.achievement \
-                    and post.achievement.visibility != AchievementVisibility.PUBLIC \
-                    and vis != Visibility.PRIVATE:
-                raise serializers.ValidationError(
-                    {"visibility": ["This achievement is private, so its post can only be private."]})
-            return attrs
-
-        # ---- create
-        images = attrs.get("images", [])
-        caption = (attrs.get("caption") or "").strip()
-        kind = attrs.get("kind")
-        achievement = announcement = None
-
-        if "achievement_id" in attrs:
-            achievement = Achievement.objects.filter(pk=attrs["achievement_id"], user=user).select_related("post").first()
-            if achievement is None:
-                raise serializers.ValidationError({"achievement_id": ["Achievement not found."]})
-            if hasattr(achievement, "post") and achievement.post is not None:
-                raise serializers.ValidationError(
-                    {"achievement_id": ["This achievement has already been posted."]})
-            kind = kind or PostKind.ACHIEVEMENT
-            if kind != PostKind.ACHIEVEMENT:
-                raise serializers.ValidationError({"kind": ["Use kind 'achievement' with achievement_id."]})
-        elif kind == PostKind.ACHIEVEMENT:
-            raise serializers.ValidationError({"achievement_id": ["Required for achievement posts."]})
-
-        if "announcement_id" in attrs:
-            announcement = Announcement.objects.filter(pk=attrs["announcement_id"],
-                                                       status=AnnouncementStatus.PUBLISHED).first()
-            if announcement is None:
-                raise serializers.ValidationError({"announcement_id": ["Event not found."]})
-            kind = kind or PostKind.EVENT
-            if kind not in (PostKind.EVENT, PostKind.ACTIVITY):
-                raise serializers.ValidationError({"kind": ["announcement_id is only for event/activity posts."]})
-
-        if kind is None:
-            kind = PostKind.IMAGE if images else PostKind.TEXT
-        if kind == PostKind.IMAGE and not images:
-            raise serializers.ValidationError({"images": ["Image posts need at least one image."]})
-        if not caption and not images and achievement is None:
-            raise serializers.ValidationError({"caption": ["A post needs text or at least one image."]})
-
-        visibility = attrs.get("visibility", Visibility.FRIENDS)
-        if achievement is not None and achievement.visibility != AchievementVisibility.PUBLIC \
-                and visibility != Visibility.PRIVATE:
+        if not self.partial and not attrs.get("content", "").strip() and not attrs.get("images"):
             raise serializers.ValidationError(
-                {"visibility": ["This achievement is private. Make it public first, or post it as private."]})
-
-        attrs.update(kind=kind, achievement=achievement, announcement=announcement, visibility=visibility,
-                     caption=caption)
+                {"content": ["A post needs text or at least one image."]}
+            )
         return attrs
 
 
-class ShareSerializer(serializers.Serializer):
-    caption = serializers.CharField(max_length=1000, required=False, allow_blank=True, default="")
-    visibility = serializers.ChoiceField(choices=Visibility.choices, default=Visibility.FRIENDS)
+class CommentWriteSerializer(StrictFieldsMixin, serializers.Serializer):
+    content = _text_field(COMMENT_MAX_LENGTH)
 
 
-# ---------------------------------------------------------------- comments
-class CommentSerializer(serializers.ModelSerializer):
-    author = UserBriefSerializer(read_only=True)
-    liked_by_me = serializers.SerializerMethodField()
-    replies_count = serializers.SerializerMethodField()
-    is_mine = serializers.SerializerMethodField()
+class ShareWriteSerializer(StrictFieldsMixin, serializers.Serializer):
+    caption = _text_field(SHARE_CAPTION_MAX_LENGTH, required=False, allow_blank=True)
+
+
+class ReportWriteSerializer(StrictFieldsMixin, serializers.Serializer):
+    reason = serializers.ChoiceField(choices=ContentReport.Reason.choices)
+    description = _text_field(REPORT_DESCRIPTION_MAX_LENGTH, required=False, allow_blank=True)
+
+
+class GenericReportWriteSerializer(ReportWriteSerializer):
+    """POST /api/social/reports/ {"content_type": "post"|"comment", "object_id": "<uuid>", "reason", "description"}"""
+
+    content_type = serializers.ChoiceField(choices=ContentReport.ContentType.choices)
+    object_id = serializers.UUIDField()
+
+
+class ResourceShareWriteSerializer(StrictFieldsMixin, serializers.Serializer):
+    """POST /api/social/shares/ - share a post, a public announcement or a verified public achievement."""
+
+    resource_type = serializers.ChoiceField(choices=["post", "announcement", "achievement"])
+    resource_id = serializers.UUIDField()
+    caption = _text_field(SHARE_CAPTION_MAX_LENGTH, required=False, allow_blank=True)
+    visibility = serializers.ChoiceField(
+        choices=[c for c in Post.Visibility.choices if c[0] != "private"], required=False
+    )
+
+
+class ReportReviewSerializer(StrictFieldsMixin, serializers.Serializer):
+    status = serializers.ChoiceField(choices=ContentReport.Status.choices)
+    review_comments = _text_field(REPORT_DESCRIPTION_MAX_LENGTH, required=False, allow_blank=True)
+    action = serializers.ChoiceField(choices=["none", "content_removed"], required=False, default="none")
+
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+def absolute_url(file_field, request):
+    if not file_field:
+        return None
+    try:
+        url = file_field.url
+    except ValueError:
+        return None
+    if request is not None and url.startswith("/"):
+        return request.build_absolute_uri(url)  # S3/CDN storages already return full URLs
+    return url
+
+
+def author_payload(user, request):
+    """
+    Public author card (shared implementation in common.serializers.user_card). A PRIVATE
+    profile's picture is shown only to its owner and admins. Needs `author__profile` to be
+    select_related (no extra query).
+    """
+    return user_card(user, getattr(request, "user", None), request)
+
+
+class AuthorMixin:
+    def get_author(self, obj):
+        return author_payload(obj.author, self.context.get("request"))
+
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+class PostMediaSerializer(serializers.ModelSerializer):
+    url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PostMedia
+        fields = ("id", "url", "width", "height", "position")
+        read_only_fields = fields
+
+    def get_url(self, obj):
+        return absolute_url(obj.image, self.context.get("request"))
+
+
+def _viewer_state(context):
+    """Viewer + their blocked/blocking user ids, computed ONCE per response (shared context)."""
+    request = context.get("request")
+    viewer = getattr(request, "user", None)
+    if "hidden_ids" not in context:
+        context["hidden_ids"] = hidden_user_ids(viewer)
+    return viewer, context["hidden_ids"]
+
+
+def _announcement_available(announcement, viewer, hidden):
+    if announcement is None or not announcement.author.is_active:
+        return False
+    if viewer is not None and viewer.is_authenticated and announcement.author_id == viewer.pk:
+        return True
+    if announcement.status != "published" or announcement.author_id in hidden:
+        return False
+    if announcement.visibility == "public":
+        return True
+    return announcement.visibility == "members_only" and bool(viewer and viewer.is_authenticated)
+
+
+def _achievement_available(achievement, viewer, hidden):
+    if achievement is None or not achievement.user.is_active:
+        return False
+    if viewer is not None and viewer.is_authenticated and achievement.user_id == viewer.pk:
+        return True
+    if achievement.verification_status != "verified" or achievement.user_id in hidden:
+        return False
+    if achievement.visibility == "public":
+        return True
+    return achievement.visibility == "members_only" and bool(viewer and viewer.is_authenticated)
+
+
+def shared_resource_payload(post, context):
+    """
+    What a share-post shows of its original. The original's CURRENT visibility is re-checked:
+    if it was deleted, unpublished, made private or its owner blocked the viewer, only
+    {"available": false} is returned (no content leaks through shares).
+    """
+    if not post.shared_type:
+        return None
+    viewer, hidden = _viewer_state(context)
+    request = context.get("request")
+    if post.shared_type == "announcement":
+        item = post.shared_announcement
+        if not _announcement_available(item, viewer, hidden):
+            return {"type": "announcement", "id": None, "available": False, "data": None}
+        return {
+            "type": "announcement", "id": str(item.pk), "available": True,
+            "data": {
+                "id": str(item.pk), "title": item.title, "short_description": item.short_description,
+                "category": item.category.name if item.category_id else None,
+                "activity_type": item.activity_type, "location": item.location,
+                "start_datetime": item.start_datetime, "end_datetime": item.end_datetime,
+                "registration_deadline": item.registration_deadline,
+                "cover_image": absolute_url(item.cover_image, request),
+            },
+        }
+    item = post.shared_achievement
+    if not _achievement_available(item, viewer, hidden):
+        return {"type": "achievement", "id": None, "available": False, "data": None}
+    return {
+        "type": "achievement", "id": str(item.pk), "available": True,
+        "data": {
+            "id": str(item.pk), "title": item.title, "achievement_type": item.achievement_type,
+            "level": item.level, "position": item.position, "organization": item.organization,
+            "achievement_date": item.achievement_date,
+            "category": item.category.name if item.category_id else None,
+            "user": user_card(item.user, viewer, request),
+        },
+    }
+
+
+class PostSerializer(AuthorMixin, serializers.ModelSerializer):
+    """Expects a queryset passed through services.annotate_posts()."""
+
+    author = serializers.SerializerMethodField()
+    media = serializers.SerializerMethodField()
+    shared_resource = serializers.SerializerMethodField()
+    like_count = serializers.IntegerField(read_only=True)
+    comment_count = serializers.IntegerField(read_only=True)
+    share_count = serializers.IntegerField(read_only=True)
+    is_liked = serializers.BooleanField(read_only=True)
+    is_owner = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Post
+        fields = (
+            "id", "author", "content", "post_type", "visibility", "media", "shared_type", "shared_resource",
+            "like_count", "comment_count", "share_count", "is_liked", "is_owner",
+            "is_edited", "created_at", "updated_at",
+        )
+        read_only_fields = fields
+
+    def get_shared_resource(self, obj):
+        return shared_resource_payload(obj, self.context)
+
+    def get_media(self, obj):
+        return PostMediaSerializer(obj.media.all(), many=True, context=self.context).data
+
+    def get_is_owner(self, obj):
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        return bool(user and user.is_authenticated and obj.author_id == user.pk)
+
+
+class CommentSerializer(AuthorMixin, serializers.ModelSerializer):
+    """Expects a queryset passed through services.annotate_comments()."""
+
+    author = serializers.SerializerMethodField()
+    post_id = serializers.UUIDField(read_only=True)
+    parent_comment_id = serializers.UUIDField(read_only=True)
+    like_count = serializers.IntegerField(read_only=True)
+    reply_count = serializers.IntegerField(read_only=True)
+    is_liked = serializers.BooleanField(read_only=True)
+    is_owner = serializers.SerializerMethodField()
 
     class Meta:
         model = Comment
-        fields = ("id", "post", "parent", "author", "body", "like_count", "liked_by_me", "replies_count",
-                  "is_mine", "is_edited", "created_at", "updated_at")
+        fields = (
+            "id", "post_id", "parent_comment_id", "depth", "author", "content",
+            "like_count", "reply_count", "is_liked", "is_owner", "is_edited", "is_deleted",
+            "created_at", "updated_at",
+        )
         read_only_fields = fields
 
-    def get_liked_by_me(self, obj):
-        return getattr(obj, "liked_by_me", False)
+    def get_is_owner(self, obj):
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        return bool(user and user.is_authenticated and obj.author_id == user.pk)
 
-    def get_replies_count(self, obj):
-        return getattr(obj, "replies_total", 0)
-
-    def get_is_mine(self, obj):
-        return obj.author_id == self.context["request"].user.pk
-
-
-class CommentWriteSerializer(serializers.Serializer):
-    body = serializers.CharField(max_length=2000)
-    parent = serializers.IntegerField(required=False, allow_null=True)
-
-    def validate_body(self, v):
-        v = v.strip()
-        if not v:
-            raise serializers.ValidationError("Comment cannot be empty.")
-        return v
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if instance.is_deleted:
+            # Placeholder: keeps the thread intact without exposing text or author.
+            data["content"] = ""
+            data["author"] = None
+            data["is_owner"] = False
+        return data
 
 
-# ---------------------------------------------------------------- notifications
-NOTIFICATION_TEXT = {
-    NotificationType.FRIEND_REQUEST: "sent you a friend request",
-    NotificationType.FRIEND_ACCEPTED: "accepted your friend request",
-    NotificationType.POST_LIKE: "liked your post",
-    NotificationType.POST_COMMENT: "commented on your post",
-    NotificationType.COMMENT_REPLY: "replied to your comment",
-    NotificationType.COMMENT_LIKE: "liked your comment",
-    NotificationType.POST_SHARE: "shared your post",
-    NotificationType.NEW_MESSAGE: "sent you a message",
-}
+class ShareSerializer(serializers.ModelSerializer):
+    """`context["post_map"]` maps post id -> serialized post (only posts the viewer may still see)."""
 
-
-class NotificationSerializer(serializers.ModelSerializer):
-    actor = UserBriefSerializer(read_only=True)
-    text = serializers.SerializerMethodField()
+    caption = serializers.CharField(source="share_caption", read_only=True)
+    original_post_id = serializers.UUIDField(read_only=True)
+    original_post = serializers.SerializerMethodField()
+    original_post_available = serializers.SerializerMethodField()
 
     class Meta:
-        model = Notification
-        fields = ("id", "type", "actor", "text", "post", "target_id", "is_read", "created_at")
+        model = PostShare
+        fields = ("id", "caption", "original_post_id", "original_post", "original_post_available", "created_at")
         read_only_fields = fields
 
-    def get_text(self, obj):
-        who = obj.actor.full_name or obj.actor.username if obj.actor else "Someone"
-        return f"{who} {NOTIFICATION_TEXT.get(obj.type, 'interacted with you')}"
+    def get_original_post(self, obj):
+        return self.context.get("post_map", {}).get(obj.original_post_id)
+
+    def get_original_post_available(self, obj):
+        return obj.original_post_id in self.context.get("post_map", {})
+
+
+class ReportReceiptSerializer(serializers.ModelSerializer):
+    """What the reporter gets back. No reporter data, no reviewer data."""
+
+    class Meta:
+        model = ContentReport
+        fields = ("id", "content_type", "reason", "status", "created_at")
+        read_only_fields = fields
+
+
+class ReportModerationSerializer(serializers.ModelSerializer):
+    """Moderator view of a report (moderators only)."""
+
+    reporter = serializers.SerializerMethodField()
+    target = serializers.SerializerMethodField()
+    reviewed_by = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ContentReport
+        fields = (
+            "id", "content_type", "target", "reporter", "reason", "description", "status",
+            "action_taken", "review_comments", "reviewed_by", "reviewed_at", "created_at",
+        )
+        read_only_fields = fields
+
+    def get_reporter(self, obj):
+        return {"id": str(obj.reporter_id), "username": obj.reporter.username}
+
+    def get_reviewed_by(self, obj):
+        return {"id": str(obj.reviewed_by_id), "username": obj.reviewed_by.username} if obj.reviewed_by_id else None
+
+    def get_target(self, obj):
+        item = obj.post if obj.post_id else obj.comment
+        return {
+            "id": str(item.pk),
+            "author_id": str(item.author_id),
+            "content": item.content,
+            "is_deleted": item.is_deleted,
+            "post_id": str(item.post_id) if obj.comment_id else str(item.pk),
+        }

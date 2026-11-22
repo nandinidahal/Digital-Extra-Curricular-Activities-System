@@ -1,106 +1,99 @@
-"""Profile picture validation. Never trusts the file name or the declared content type."""
-import io
-import os
-from collections import namedtuple
+"""
+Validators for the Profiles module.
 
-from django.conf import settings
+Text and URL validators are plain functions so they can be used both by the
+model (admin / full_clean) and by the serializers. Image validation inspects
+the real file content with Pillow; the file extension and the Content-Type sent
+by the client are never trusted.
+"""
+import unicodedata
+from urllib.parse import urlparse
+
 from django.core.exceptions import ValidationError
-from django.core.files.base import ContentFile
-from PIL import Image, ImageOps
+from django.core.validators import URLValidator
 
-DEFAULT_MAX_SIZE = 2 * 1024 * 1024  # 2 MB
-DEFAULT_MAX_DIMENSION = 4096        # pixels, width and height
-MB = 1024 * 1024
+from common.validators import validate_image_content
 
-# Pillow format -> (stored extension, content type, extensions a client may use)
-FORMATS = {
-    "JPEG": (".jpg", "image/jpeg", {".jpg", ".jpeg"}),
-    "PNG": (".png", "image/png", {".png"}),
-    "WEBP": (".webp", "image/webp", {".webp"}),
+ALLOWED_IMAGE_FORMATS = {
+    # Pillow format name -> file extension we store
+    "JPEG": "jpg",
+    "PNG": "png",
+    "WEBP": "webp",
 }
-ALLOWED_DECLARED_CONTENT_TYPES = {"image/jpeg", "image/jpg", "image/pjpeg", "image/png", "image/webp"}
+DEFAULT_MAX_IMAGE_PIXELS = 25_000_000  # 25 megapixels; guards against decompression bombs
 
-ProcessedImage = namedtuple("ProcessedImage", "content extension content_type")
-
-
-def max_picture_size():
-    return int(getattr(settings, "PROFILE_PICTURE_MAX_SIZE", DEFAULT_MAX_SIZE))
+_web_url_validator = URLValidator(schemes=["http", "https"])
 
 
-def max_picture_dimension():
-    return int(getattr(settings, "PROFILE_PICTURE_MAX_DIMENSION", DEFAULT_MAX_DIMENSION))
+# ---------------------------------------------------------------------------
+# Text
+# ---------------------------------------------------------------------------
+def _has_control_chars(value, allowed=""):
+    return any(unicodedata.category(ch) == "Cc" and ch not in allowed for ch in value)
 
 
-def _human_size(n):
-    return f"{n / MB:.1f} MB".replace(".0 MB", " MB") if n >= MB else f"{max(1, round(n / 1024))} KB"
+def validate_single_line(value):
+    """No control characters at all (no newlines, tabs, NUL bytes...)."""
+    if value and _has_control_chars(value):
+        raise ValidationError("Control characters and line breaks are not allowed here.")
 
 
-def process_profile_picture(upload):
-    """Validate an uploaded picture and return a clean, re-encoded copy.
+def validate_multiline(value):
+    """Newlines and tabs are fine in a bio; other control characters are not."""
+    if value and _has_control_chars(value, allowed="\n\r\t"):
+        raise ValidationError("Control characters are not allowed.")
 
-    Checks: extension, size, declared content type, real image content (Pillow), that the
-    content matches the extension, and the pixel dimensions (decompression-bomb guard).
-    The image is re-encoded from its pixels, which strips EXIF data such as GPS location.
-    Animated images keep only their first frame.
+
+def validate_tag_list(value):
+    """Interests / skills are stored as a JSON list of short, non-empty strings."""
+    if not isinstance(value, list):
+        raise ValidationError("Must be a list of text values.")
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ValidationError("Every item must be non-empty text.")
+        if len(item) > 40:
+            raise ValidationError("Each item can be at most 40 characters.")
+
+
+# ---------------------------------------------------------------------------
+# URLs
+# ---------------------------------------------------------------------------
+def validate_web_url(value):
+    """http(s) only: rejects javascript:, data:, ftp: and similar schemes."""
+    if not value:
+        return
+    try:
+        _web_url_validator(value)
+    except ValidationError:
+        raise ValidationError("Enter a valid URL starting with http:// or https://.")
+
+
+def _validate_host(value, domain, label):
+    if not value:
+        return
+    validate_web_url(value)
+    host = (urlparse(value).hostname or "").lower()
+    if host != domain and not host.endswith("." + domain):
+        raise ValidationError(f"Enter a valid {label} URL (it must be on {domain}).")
+
+
+def validate_linkedin_url(value):
+    _validate_host(value, "linkedin.com", "LinkedIn")
+
+
+def validate_github_url(value):
+    _validate_host(value, "github.com", "GitHub")
+
+
+# ---------------------------------------------------------------------------
+# Images
+# ---------------------------------------------------------------------------
+def validate_image_upload(upload, *, max_bytes):
     """
-    name = getattr(upload, "name", "") or ""
-    ext = os.path.splitext(name)[1].lower()
-    allowed_exts = sorted({e for _, _, exts in FORMATS.values() for e in exts})
-    if ext not in allowed_exts:
-        raise ValidationError("Unsupported file type. Allowed types: JPEG, PNG and WebP.", code="invalid_extension")
+    Validate an uploaded image and return its real format ("JPEG", "PNG", "WEBP").
 
-    size = getattr(upload, "size", None)
-    if not size:
-        raise ValidationError("The submitted file is empty.", code="empty_file")
-    limit = max_picture_size()
-    if size > limit:
-        raise ValidationError(
-            f"Image is too large ({_human_size(size)}). The maximum allowed size is {_human_size(limit)}.",
-            code="file_too_large",
-        )
-
-    declared = (getattr(upload, "content_type", "") or "").split(";")[0].strip().lower()
-    if declared and declared not in ALLOWED_DECLARED_CONTENT_TYPES:
-        raise ValidationError(f"Unsupported content type '{declared}'.", code="invalid_content_type")
-
-    upload.seek(0)
-    try:
-        probe = Image.open(upload)
-        fmt = probe.format
-        width, height = probe.size  # read from the header only; nothing is decoded yet
-    except Exception:
-        raise ValidationError("The file is not a valid image.", code="invalid_content")
-    if fmt not in FORMATS:
-        raise ValidationError("Images must be JPEG, PNG or WebP.", code="invalid_format")
-    if ext not in FORMATS[fmt][2]:
-        raise ValidationError("The file contents do not match its extension.", code="extension_mismatch")
-    max_dim = max_picture_dimension()
-    if width > max_dim or height > max_dim:
-        raise ValidationError(
-            f"Image dimensions are too large. The maximum is {max_dim}x{max_dim} pixels.", code="dimensions_too_large"
-        )
-
-    try:
-        upload.seek(0)
-        Image.open(upload).verify()  # detects truncated / corrupt files
-        upload.seek(0)
-        img = Image.open(upload)
-        img.load()
-        img = ImageOps.exif_transpose(img)  # honour camera rotation before metadata is dropped
-        extension, content_type, _ = FORMATS[fmt]
-        if fmt == "JPEG":
-            img = img.convert("RGB")
-        elif img.mode not in ("RGB", "RGBA", "L", "LA"):
-            img = img.convert("RGBA" if "A" in img.getbands() or "transparency" in img.info else "RGB")
-        buf = io.BytesIO()
-        if fmt == "JPEG":
-            img.save(buf, "JPEG", quality=90, optimize=True)
-        elif fmt == "WEBP":
-            img.save(buf, "WEBP", quality=90)
-        else:
-            img.save(buf, "PNG", optimize=True)
-    except Exception:
-        raise ValidationError("The file is not a valid image.", code="invalid_content")
-    finally:
-        upload.seek(0)
-    return ProcessedImage(ContentFile(buf.getvalue()), extension, content_type)
+    Checks: size limit, that Pillow can really parse the file, that the detected
+    format is allowed, a pixel-count limit, and structural integrity.
+    The implementation is shared by every module and lives in common.validators.
+    """
+    return validate_image_content(upload, max_bytes=max_bytes)

@@ -1,324 +1,492 @@
+"""
+API views of the Social module (all under /api/social/).
+
+Common rules
+* Reading endpoints accept visitors; what they see is decided by social.permissions.
+* Every write needs a valid JWT. The author/owner always comes from `request.user`.
+* Content the viewer may not see answers 404 (private) or 401 (members-only, visitor).
+"""
 from django.contrib.auth import get_user_model
-from django.db import transaction
-from django.db.models import Count, Exists, OuterRef, Q
-from rest_framework import mixins, status, viewsets
-from rest_framework.decorators import action
-from rest_framework.exceptions import NotFound, PermissionDenied
-from rest_framework.generics import GenericAPIView
+from rest_framework import status
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
-from rest_framework.response import Response
-from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
-from achievements import selectors as achievement_selectors
-from achievements.serializers import OwnerAchievementSerializer, PublicAchievementSerializer
-from friends.models import Friendship
-from friends.selectors import blocked_id_subqueries, mutual_friends
-from friends.services import get_relationship
+from accounts.responses import success_response
+from common.permissions import IsModerator
+from common.relationships import is_blocked_between
+from profiles.authentication import OptionalJWTAuthentication
 
-from . import feed, services
-from profiles.models import UserProfile
-from .models import Comment, CommentLike, Notification, Post, PostLike, Visibility
-from .pagination import FeedCursorPagination, NotificationCursorPagination, StandardPagination
-from .serializers import (CommentSerializer, CommentWriteSerializer, NotificationSerializer,
-                          PostSerializer, PostWriteSerializer, ProfileSerializer, ProfileUpdateSerializer,
-                          ShareSerializer, UserBriefSerializer)
-from .visibility import (annotate_for_viewer, can_view_user_content, get_visible_post_or_404, visible_posts,
-                         visible_posts_q)
+from . import services
+from .exceptions import AuthorNotFound, MediaNotFound, NotOwner, ShareNotFound, UploadTooLarge
+from .models import Comment, ContentReport, Post, PostShare
+from .pagination import CommentPagination, SocialPagination
+from .permissions import ReadPublicWriteAuthenticated, is_admin
+from .serializers import (
+    CommentSerializer,
+    CommentWriteSerializer,
+    GenericReportWriteSerializer,
+    ReportModerationSerializer,
+    ReportReviewSerializer,
+    ResourceShareWriteSerializer,
+    PostSerializer,
+    PostWriteSerializer,
+    ReportReceiptSerializer,
+    ReportWriteSerializer,
+    ShareSerializer,
+    ShareWriteSerializer,
+)
+from .throttles import CommentWriteThrottle, InteractionThrottle, PostWriteThrottle, ReportThrottle
+from .validators import MULTIPART_OVERHEAD_BYTES, max_image_bytes, max_images_per_post
 
-User = get_user_model()
-WRITE_PARSERS = [MultiPartParser, FormParser, JSONParser]
+
+class SocialAPIView(APIView):
+    """Optional JWT: a missing/expired token means "visitor", and writes then answer 401."""
+
+    authentication_classes = [OptionalJWTAuthentication]
+    permission_classes = [ReadPublicWriteAuthenticated]
+    parser_classes = [JSONParser]
+
+    @property
+    def ctx(self):
+        return {"request": self.request}
 
 
-def _post_response(request, post_id, status_code=200):
-    post = annotate_for_viewer(visible_posts(request.user).filter(pk=post_id), request.user).first()
-    return Response(PostSerializer(post, context={"request": request}).data, status=status_code)
+class AuthenticatedAPIView(SocialAPIView):
+    permission_classes = [IsAuthenticated]
 
 
-# ---------------------------------------------------------------- home + feed
-class FeedView(GenericAPIView):
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+def _post_data(request, post_id):
+    post = services.annotate_posts(services.feed_posts(request.user).filter(pk=post_id), request.user).first()
+    if post is None:  # e.g. the author just made it private and an admin edited it: fall back
+        post = services.annotate_posts(services.readable_posts(request.user).filter(pk=post_id), request.user).get()
+    return PostSerializer(post, context={"request": request}).data
+
+
+def _comment_data(request, comment_id):
+    comment = services.annotate_comments(Comment.objects.filter(pk=comment_id), request.user).get()
+    return CommentSerializer(comment, context={"request": request}).data
+
+
+def _paginated_posts(request, queryset, paginator_class=SocialPagination):
+    queryset = services.apply_post_filters(queryset, request.query_params)
+    queryset = services.annotate_posts(queryset, request.user)
+    paginator = paginator_class()
+    page = paginator.paginate_queryset(queryset, request, view=None)
+    data = PostSerializer(page, many=True, context={"request": request}).data
+    return paginator.get_paginated_response(data)
+
+
+def _check_upload_size(request):
+    """Refuse oversized multipart bodies from the Content-Length header, before parsing them."""
+    try:
+        length = int(request.META.get("CONTENT_LENGTH") or 0)
+    except ValueError:
+        length = 0
+    limit = max_images_per_post() * max_image_bytes() + MULTIPART_OVERHEAD_BYTES
+    if length > limit:
+        raise UploadTooLarge()
+
+
+def _require_owner(user, owner_id):
+    if owner_id != user.pk:
+        raise NotOwner()
+
+
+# ---------------------------------------------------------------------------
+# Posts and feeds
+# ---------------------------------------------------------------------------
+class PostListCreateView(SocialAPIView):
     """
-    GET /api/social/feed/?mode=latest|ranked&scope=all|friends
-    latest: cursor pagination ({next, previous, results}); ranked: page-number pagination.
+    GET  /api/social/posts/  -> every post the viewer may see, newest first
+    POST /api/social/posts/  -> create a post (JSON or multipart)
     """
-    serializer_class = PostSerializer
+
+    parser_classes = [JSONParser, MultiPartParser, FormParser]
+    throttle_classes = [PostWriteThrottle]
 
     def get(self, request):
-        mode = request.query_params.get("mode", "latest")
+        return _paginated_posts(request, services.feed_posts(request.user))
+
+    def post(self, request):
+        _check_upload_size(request)
+        serializer = PostWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        post = services.create_post(request.user, serializer.validated_data)
+        return success_response({"post": _post_data(request, post.pk)}, "Post created.", status.HTTP_201_CREATED)
+
+
+class FeedView(SocialAPIView):
+    """
+    GET /api/social/feed/?scope=all|friends&post_type=&shared_type=announcement|achievement
+    Own posts + friends' posts (incl. friends-only) + public/members-only posts + shared
+    announcements/achievements, newest first. Blocked users never appear. scope=friends keeps
+    only the viewer's own and friends' posts (needs login).
+    """
+
+    def get(self, request):
         scope = request.query_params.get("scope", "all")
-        if scope not in ("all", "friends"):
-            scope = "all"
-        ctx = {"request": request}
-        if mode == "ranked":
-            paginator = StandardPagination()
-            page = paginator.paginate_queryset(feed.ranked_feed(request.user, scope), request, view=self)
-            return paginator.get_paginated_response(PostSerializer(page, many=True, context=ctx).data)
-        paginator = FeedCursorPagination()
-        page = paginator.paginate_queryset(feed.latest_feed(request.user, scope), request, view=self)
-        return paginator.get_paginated_response(PostSerializer(page, many=True, context=ctx).data)
+        return _paginated_posts(request, services.scoped_feed(request.user, scope))
 
 
-class HomeView(APIView):
-    """One call for the landing page chrome: badges + suggestions. The feed is loaded separately."""
+class PostDetailView(SocialAPIView):
+    """GET / PATCH / DELETE /api/social/posts/<post_id>/"""
 
-    def get(self, request):
-        from friends.models import FriendRequest, RequestStatus
-        from friends.suggestions import suggest_friends
-        from messaging.selectors import unread_message_count
+    parser_classes = [JSONParser, MultiPartParser, FormParser]
+    throttle_classes = [PostWriteThrottle]
 
-        user = request.user
-        ctx = {"request": request}
-        suggestions = suggest_friends(user, limit=5)
-        return Response({
-            "me": UserBriefSerializer(User.objects.select_related("user_profile").get(pk=user.pk), context=ctx).data,
-            "unread_notifications": Notification.objects.filter(recipient=user, is_read=False).count(),
-            "pending_friend_requests": FriendRequest.objects.filter(
-                receiver=user, status=RequestStatus.PENDING, is_ignored=False).count(),
-            "unread_messages": unread_message_count(user),
-            "suggested_friends": [
-                {"user": UserBriefSerializer(s["user"], context=ctx).data, "reasons": s["reasons"]}
-                for s in suggestions
-            ],
-        })
+    def get(self, request, post_id):
+        post = services.get_post(request.user, post_id, annotated=True)
+        return success_response({"post": PostSerializer(post, context=self.ctx).data})
 
+    def patch(self, request, post_id):
+        post = services.get_post(request.user, post_id, write=True)
+        _require_owner(request.user, post.author_id)
+        _check_upload_size(request)
+        serializer = PostWriteSerializer(data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        services.update_post(post, serializer.validated_data)
+        return success_response({"post": _post_data(request, post.pk)}, "Post updated.")
 
-# ---------------------------------------------------------------- posts
-class PostViewSet(mixins.CreateModelMixin, mixins.RetrieveModelMixin, mixins.UpdateModelMixin,
-                  mixins.DestroyModelMixin, viewsets.GenericViewSet):
-    parser_classes = WRITE_PARSERS
-    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
-    throttle_classes = [ScopedRateThrottle]
-    throttle_scope = "social_write"
-
-    def get_throttles(self):
-        # reads are never throttled by the write scope
-        if self.request.method in ("GET", "HEAD", "OPTIONS"):
-            return []
-        return super().get_throttles()
-
-    def get_queryset(self):
-        user = self.request.user
-        if self.action in ("update", "partial_update", "destroy"):
-            return Post.objects.filter(author=user)          # only the author can modify; others get 404
-        return annotate_for_viewer(visible_posts(user), user)  # everyone else: strictly visible posts
-
-    def get_serializer_class(self):
-        return PostWriteSerializer if self.action in ("create", "update", "partial_update") else PostSerializer
-
-    def create(self, request, *args, **kwargs):
-        s = PostWriteSerializer(data=request.data, context={"request": request})
-        s.is_valid(raise_exception=True)
-        v = s.validated_data
-        post = services.create_post(request.user, caption=v["caption"], visibility=v["visibility"], kind=v["kind"],
-                                    images=v.get("images", []), achievement=v.get("achievement"),
-                                    announcement=v.get("announcement"))
-        return _post_response(request, post.pk, status.HTTP_201_CREATED)
-
-    def partial_update(self, request, *args, **kwargs):
-        post = self.get_object()
-        s = PostWriteSerializer(post, data=request.data, partial=True, context={"request": request})
-        s.is_valid(raise_exception=True)
-        v = s.validated_data
-        services.update_post(post, caption=v.get("caption"), visibility=v.get("visibility"),
-                             add_images=v.get("images", []), remove_image_ids=v.get("remove_image_ids", []))
-        return _post_response(request, post.pk)
-
-    def perform_destroy(self, instance):
-        services.delete_post(instance)
-
-    # ---- likes
-    @action(detail=True, methods=["post", "delete"], url_path="like")
-    def like(self, request, pk=None):
-        fn = services.like_post if request.method == "POST" else services.unlike_post
-        post = fn(request.user, int(pk))
-        return Response({"liked": request.method == "POST", "like_count": post.like_count})
-
-    @action(detail=True, methods=["get"], url_path="likes", throttle_classes=[])
-    def likes(self, request, pk=None):
-        post = get_visible_post_or_404(request.user, pk)
-        ba, bb = blocked_id_subqueries(request.user)
-        qs = (PostLike.objects.filter(post=post).exclude(user_id__in=ba).exclude(user_id__in=bb)
-              .select_related("user", "user__user_profile").order_by("-created_at", "-id"))
-        paginator = StandardPagination()
-        page = paginator.paginate_queryset(qs, request, view=self)
-        data = UserBriefSerializer([l.user for l in page], many=True, context={"request": request}).data
-        return paginator.get_paginated_response(data)
-
-    # ---- comments
-    @action(detail=True, methods=["get", "post"], url_path="comments")
-    def comments(self, request, pk=None):
-        if request.method == "POST":
-            s = CommentWriteSerializer(data=request.data)
-            s.is_valid(raise_exception=True)
-            comment = services.add_comment(request.user, int(pk), s.validated_data["body"],
-                                           s.validated_data.get("parent"))
-            return Response(self._comments(request, Comment.objects.filter(pk=comment.pk))[0],
-                            status=status.HTTP_201_CREATED)
-        post = get_visible_post_or_404(request.user, pk)
-        qs = Comment.objects.filter(post=post, parent__isnull=True)
-        paginator = StandardPagination()
-        page = paginator.paginate_queryset(self._visible_comments(request, qs), request, view=self)
-        return paginator.get_paginated_response(CommentSerializer(page, many=True, context={"request": request}).data)
-
-    @staticmethod
-    def _visible_comments(request, qs):
-        ba, bb = blocked_id_subqueries(request.user)
-        return (qs.exclude(author_id__in=ba).exclude(author_id__in=bb)
-                .select_related("author", "author__user_profile")
-                .annotate(liked_by_me=Exists(CommentLike.objects.filter(comment=OuterRef("pk"), user=request.user)),
-                          replies_total=Count("replies", distinct=True))
-                .order_by("created_at", "id"))
-
-    def _comments(self, request, qs):
-        return CommentSerializer(self._visible_comments(request, qs), many=True, context={"request": request}).data
-
-    # ---- share
-    @action(detail=True, methods=["post"], url_path="share")
-    def share(self, request, pk=None):
-        s = ShareSerializer(data=request.data)
-        s.is_valid(raise_exception=True)
-        share = services.share_post(request.user, int(pk), s.validated_data["caption"].strip(),
-                                    s.validated_data["visibility"])
-        return _post_response(request, share.pk, status.HTTP_201_CREATED)
+    def delete(self, request, post_id):
+        post = services.get_post(request.user, post_id, write=True)
+        _require_owner(request.user, post.author_id)
+        services.delete_post(post)
+        return success_response(message="Post deleted.")
 
 
-class CommentViewSet(viewsets.GenericViewSet):
-    throttle_classes = [ScopedRateThrottle]
-    throttle_scope = "social_write"
-    queryset = Comment.objects.none()
+class PostMediaDetailView(AuthenticatedAPIView):
+    """DELETE /api/social/posts/<post_id>/media/<media_id>/  -> remove one attachment (owner only)"""
 
-    def get_throttles(self):
-        return [] if self.request.method in ("GET", "HEAD", "OPTIONS") else super().get_throttles()
-
-    def _one(self, request, comment_id):
-        qs = PostViewSet._visible_comments(request, Comment.objects.filter(pk=comment_id))
-        return CommentSerializer(qs.get(), context={"request": request}).data
-
-    def partial_update(self, request, pk=None):
-        s = CommentWriteSerializer(data=request.data)
-        s.is_valid(raise_exception=True)
-        services.edit_comment(request.user, int(pk), s.validated_data["body"])
-        return Response(self._one(request, pk))
-
-    def destroy(self, request, pk=None):
-        services.delete_comment(request.user, int(pk))
-        return Response(status=status.HTTP_204_NO_CONTENT)
-
-    @action(detail=True, methods=["post", "delete"], url_path="like")
-    def like(self, request, pk=None):
-        fn = services.like_comment if request.method == "POST" else services.unlike_comment
-        comment = fn(request.user, int(pk))
-        return Response({"liked": request.method == "POST", "like_count": comment.like_count})
-
-    @action(detail=True, methods=["get"], url_path="replies")
-    def replies(self, request, pk=None):
-        parent = services.get_comment_for_user(request.user, int(pk))
-        qs = PostViewSet._visible_comments(request, Comment.objects.filter(parent=parent))
-        paginator = StandardPagination()
-        page = paginator.paginate_queryset(qs, request, view=self)
-        return paginator.get_paginated_response(CommentSerializer(page, many=True, context={"request": request}).data)
+    def delete(self, request, post_id, media_id):
+        post = services.get_post(request.user, post_id, write=True)
+        _require_owner(request.user, post.author_id)
+        media = post.media.filter(pk=media_id).first()
+        if media is None:
+            raise MediaNotFound()
+        services.remove_post_media(post, media)
+        return success_response({"post": _post_data(request, post.pk)}, "Attachment removed.")
 
 
-# ---------------------------------------------------------------- profiles
-def _get_profile_user(viewer, username):
-    target = User.objects.select_related("user_profile").filter(username__iexact=username).first()
-    if target is None or not can_view_user_content(viewer, target):
-        raise NotFound("User not found.")
-    return target
+class UserPostsView(SocialAPIView):
+    """GET /api/social/users/<user_id>/posts/  -> that user's posts the viewer may see"""
+
+    def get(self, request, user_id):
+        author = get_user_model().objects.filter(pk=user_id, is_active=True).first()
+        if author is None or (
+            request.user.is_authenticated and not is_admin(request.user) and is_blocked_between(request.user, author)
+        ):
+            raise AuthorNotFound()
+        queryset = services.readable_posts(request.user).filter(author_id=user_id)
+        return _paginated_posts(request, queryset)
 
 
-class MyProfileView(APIView):
-    parser_classes = WRITE_PARSERS
+class MyPostsView(AuthenticatedAPIView):
+    """GET /api/social/me/posts/  -> own posts, every visibility, newest first"""
 
     def get(self, request):
-        return ProfileView().get(request, request.user.username)
-
-    def patch(self, request):
-        profile, _ = UserProfile.objects.get_or_create(user=request.user)
-        s = ProfileUpdateSerializer(profile, data=request.data, partial=True)
-        s.is_valid(raise_exception=True)
-        s.save()
-        return ProfileView().get(request, request.user.username)
+        queryset = Post.objects.filter(author=request.user, is_deleted=False)
+        return _paginated_posts(request, queryset)
 
 
-class ProfileView(APIView):
-    def get(self, request, username):
-        viewer = request.user
-        target = _get_profile_user(viewer, username)
-        is_self = target.pk == viewer.pk
-        friends_count = Friendship.objects.filter(Q(user_low=target) | Q(user_high=target)).count()
-        achievements = (achievement_selectors.owned_by(target) if is_self
-                        else achievement_selectors.public_of(target))
-        rel = get_relationship(viewer, target)
-        stats = {
-            "is_self": is_self,
-            "friends_count": friends_count,
-            "posts_count": visible_posts(viewer).filter(author=target).count(),
-            "achievements_count": achievements.count(),
-            "mutual_friends_count": 0 if is_self else mutual_friends(viewer, target).count(),
-            "relationship": rel,
-            "is_friend": rel["state"] == "FRIENDS",
-            # Non-friends may message (limited to 4 messages until friends); only blocks stop it.
-            "can_message": not is_self and rel["state"] not in ("BLOCKED", "BLOCKED_BY"),
-        }
-        return Response(ProfileSerializer(target, context={"request": request, "stats": stats}).data)
+# ---------------------------------------------------------------------------
+# Post likes
+# ---------------------------------------------------------------------------
+class PostLikeView(AuthenticatedAPIView):
+    """POST like (201 new, 200 already liked) / DELETE unlike (always 200). Both idempotent."""
+
+    throttle_classes = [InteractionThrottle]
+
+    def post(self, request, post_id):
+        post = services.get_post(request.user, post_id, write=True)
+        created = services.like_post(request.user, post)
+        return success_response(
+            services.post_like_state(request.user, post.pk),
+            "Post liked." if created else "You already liked this post.",
+            status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
+
+    def delete(self, request, post_id):
+        post = services.get_post(request.user, post_id, write=True)
+        services.unlike_post(request.user, post)
+        return success_response(services.post_like_state(request.user, post.pk), "Like removed.")
 
 
-class ProfilePostsView(GenericAPIView):
-    serializer_class = PostSerializer
+# ---------------------------------------------------------------------------
+# Comments
+# ---------------------------------------------------------------------------
+class PostCommentsView(SocialAPIView):
+    """
+    GET  /api/social/posts/<post_id>/comments/  -> top-level comments, oldest first, paginated
+    POST /api/social/posts/<post_id>/comments/  -> new top-level comment
+    """
 
-    def get(self, request, username):
-        target = _get_profile_user(request.user, username)
-        qs = annotate_for_viewer(visible_posts(request.user).filter(author=target), request.user)
-        paginator = FeedCursorPagination()
-        page = paginator.paginate_queryset(qs, request, view=self)
-        return paginator.get_paginated_response(PostSerializer(page, many=True, context={"request": request}).data)
+    throttle_classes = [CommentWriteThrottle]
+
+    def get(self, request, post_id):
+        post = services.get_post(request.user, post_id)
+        queryset = services.annotate_comments(services.visible_top_level_comments(post, request.user), request.user)
+        paginator = CommentPagination()
+        page = paginator.paginate_queryset(queryset, request, view=None)
+        return paginator.get_paginated_response(CommentSerializer(page, many=True, context=self.ctx).data)
+
+    def post(self, request, post_id):
+        post = services.get_post(request.user, post_id, write=True)
+        serializer = CommentWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        comment = services.create_comment(request.user, post, serializer.validated_data["content"])
+        return success_response(
+            {"comment": _comment_data(request, comment.pk)}, "Comment added.", status.HTTP_201_CREATED
+        )
 
 
-class ProfileAchievementsView(GenericAPIView):
-    """Achievements shown on a profile; backed by the achievements app (single Achievement model)."""
-    serializer_class = PublicAchievementSerializer
+class CommentDetailView(AuthenticatedAPIView):
+    """PATCH / DELETE /api/social/comments/<comment_id>/  (author only)"""
 
-    def get(self, request, username):
-        target = _get_profile_user(request.user, username)
-        is_self = target.pk == request.user.pk
-        # private achievements are never exposed to others
-        qs = achievement_selectors.owned_by(target) if is_self else achievement_selectors.public_of(target)
-        serializer_class = OwnerAchievementSerializer if is_self else PublicAchievementSerializer
-        paginator = StandardPagination()
-        page = paginator.paginate_queryset(qs, request, view=self)
-        return paginator.get_paginated_response(serializer_class(page, many=True, context={"request": request}).data)
+    throttle_classes = [CommentWriteThrottle]
+
+    def patch(self, request, comment_id):
+        comment = services.get_comment(request.user, comment_id, write=True)
+        _require_owner(request.user, comment.author_id)
+        serializer = CommentWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        services.update_comment(comment, serializer.validated_data["content"])
+        return success_response({"comment": _comment_data(request, comment.pk)}, "Comment updated.")
+
+    def delete(self, request, comment_id):
+        comment = services.get_comment(request.user, comment_id, write=True)
+        _require_owner(request.user, comment.author_id)
+        services.delete_comment(comment)
+        return success_response(message="Comment deleted.")
 
 
-# ---------------------------------------------------------------- notifications
-class NotificationViewSet(viewsets.GenericViewSet):
-    serializer_class = NotificationSerializer
-    pagination_class = NotificationCursorPagination
-    queryset = Notification.objects.none()
+class CommentReplyView(AuthenticatedAPIView):
+    """POST /api/social/comments/<comment_id>/reply/"""
 
-    def get_queryset(self):
-        return Notification.objects.filter(recipient=self.request.user).select_related("actor", "actor__user_profile")
+    throttle_classes = [CommentWriteThrottle]
 
-    def list(self, request):
-        qs = self.get_queryset()
-        if request.query_params.get("unread") in ("1", "true"):
-            qs = qs.filter(is_read=False)
-        page = self.paginate_queryset(qs)
-        return self.get_paginated_response(self.get_serializer(page, many=True).data)
+    def post(self, request, comment_id):
+        parent = services.get_comment(request.user, comment_id, write=True)
+        serializer = CommentWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        reply = services.create_comment(
+            request.user, parent.post, serializer.validated_data["content"], parent=parent
+        )
+        return success_response(
+            {"comment": _comment_data(request, reply.pk)}, "Reply added.", status.HTTP_201_CREATED
+        )
 
-    @action(detail=False, methods=["get"], url_path="unread-count")
-    def unread_count(self, request):
-        return Response({"unread": self.get_queryset().filter(is_read=False).count()})
 
-    @action(detail=True, methods=["post"], url_path="read")
-    def read(self, request, pk=None):
-        updated = self.get_queryset().filter(pk=pk).update(is_read=True)
-        if not updated:
-            raise NotFound("Notification not found.")
-        return Response({"read": True})
+class CommentRepliesView(SocialAPIView):
+    """GET /api/social/comments/<comment_id>/replies/  -> direct replies, oldest first, paginated"""
 
-    @action(detail=False, methods=["post"], url_path="read-all")
-    def read_all(self, request):
-        n = self.get_queryset().filter(is_read=False).update(is_read=True)
-        return Response({"marked_read": n})
+    def get(self, request, comment_id):
+        parent = services.get_comment(request.user, comment_id, allow_deleted=True)
+        queryset = services.annotate_comments(services.visible_replies(parent, request.user), request.user)
+        paginator = CommentPagination()
+        page = paginator.paginate_queryset(queryset, request, view=None)
+        return paginator.get_paginated_response(CommentSerializer(page, many=True, context=self.ctx).data)
+
+
+class CommentLikeView(AuthenticatedAPIView):
+    throttle_classes = [InteractionThrottle]
+
+    def post(self, request, comment_id):
+        comment = services.get_comment(request.user, comment_id, write=True)
+        created = services.like_comment(request.user, comment)
+        return success_response(
+            services.comment_like_state(request.user, comment.pk),
+            "Comment liked." if created else "You already liked this comment.",
+            status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
+
+    def delete(self, request, comment_id):
+        comment = services.get_comment(request.user, comment_id, write=True)
+        services.unlike_comment(request.user, comment)
+        return success_response(services.comment_like_state(request.user, comment.pk), "Like removed.")
+
+
+# ---------------------------------------------------------------------------
+# Shares
+# ---------------------------------------------------------------------------
+def _share_page_payload(request, shares):
+    """Serialize shares with their original posts, fetched in ONE annotated query."""
+    ids = [share.original_post_id for share in shares]
+    posts = services.annotate_posts(services.feed_posts(request.user).filter(pk__in=ids), request.user)
+    post_map = {
+        post.pk: PostSerializer(post, context={"request": request}).data for post in posts
+    }
+    return ShareSerializer(shares, many=True, context={"request": request, "post_map": post_map}).data
+
+
+class PostShareView(AuthenticatedAPIView):
+    """POST /api/social/posts/<post_id>/share/  body: {"caption": "optional"}"""
+
+    throttle_classes = [InteractionThrottle]
+
+    def post(self, request, post_id):
+        post = services.get_post(request.user, post_id, write=True)
+        serializer = ShareWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        share = services.share_post(request.user, post, serializer.validated_data.get("caption", ""))
+        data = _share_page_payload(request, [share])[0]
+        data["share_count"] = post.shares.count()
+        return success_response({"share": data}, "Post shared.", status.HTTP_201_CREATED)
+
+
+class ShareDetailView(AuthenticatedAPIView):
+    """DELETE /api/social/shares/<share_id>/  (the sharer only)"""
+
+    def delete(self, request, share_id):
+        share = PostShare.objects.filter(pk=share_id).first()
+        if share is None:
+            raise ShareNotFound()
+        _require_owner(request.user, share.user_id)
+        share.delete()
+        return success_response(message="Share removed.")
+
+
+class MySharesView(AuthenticatedAPIView):
+    """GET /api/social/me/shares/"""
+
+    def get(self, request):
+        queryset = PostShare.objects.filter(user=request.user)
+        paginator = SocialPagination()
+        page = paginator.paginate_queryset(queryset, request, view=None)
+        return paginator.get_paginated_response(_share_page_payload(request, page))
+
+
+# ---------------------------------------------------------------------------
+# Reports
+# ---------------------------------------------------------------------------
+class PostReportView(AuthenticatedAPIView):
+    """POST /api/social/posts/<post_id>/report/"""
+
+    throttle_classes = [ReportThrottle]
+
+    def post(self, request, post_id):
+        post = services.get_post(request.user, post_id, write=True)
+        serializer = ReportWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        report = services.report_content(request.user, post=post, **serializer.validated_data)
+        return success_response(
+            {"report": ReportReceiptSerializer(report).data},
+            "Thank you. Your report was submitted and will be reviewed.",
+            status.HTTP_201_CREATED,
+        )
+
+
+class CommentReportView(AuthenticatedAPIView):
+    """POST /api/social/comments/<comment_id>/report/"""
+
+    throttle_classes = [ReportThrottle]
+
+    def post(self, request, comment_id):
+        comment = services.get_comment(request.user, comment_id, write=True)
+        serializer = ReportWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        report = services.report_content(request.user, comment=comment, **serializer.validated_data)
+        return success_response(
+            {"report": ReportReceiptSerializer(report).data},
+            "Thank you. Your report was submitted and will be reviewed.",
+            status.HTTP_201_CREATED,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Generic share and report endpoints, report moderation
+# ---------------------------------------------------------------------------
+class ResourceShareView(AuthenticatedAPIView):
+    """
+    POST /api/social/shares/
+    {"resource_type": "post" | "announcement" | "achievement", "resource_id": "<uuid>",
+     "caption": "optional", "visibility": "public|members_only|friends"}
+    A post share is a PostShare row (unchanged behaviour). An announcement/achievement share is a
+    new post that REFERENCES the original (shown in feeds; the original's visibility is re-checked).
+    """
+
+    throttle_classes = [InteractionThrottle]
+
+    def post(self, request):
+        serializer = ResourceShareWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        caption = data.get("caption", "")
+        if data["resource_type"] == "post":
+            post = services.get_post(request.user, data["resource_id"], write=True)
+            share = services.share_post(request.user, post, caption)
+            payload = _share_page_payload(request, [share])[0]
+            payload["share_count"] = post.shares.count()
+            return success_response({"share": payload}, "Post shared.", status.HTTP_201_CREATED)
+        post = services.share_resource(
+            request.user, data["resource_type"], data["resource_id"], caption,
+            data.get("visibility", Post.Visibility.PUBLIC),
+        )
+        return success_response(
+            {"post": _post_data(request, post.pk)}, f"{data['resource_type'].capitalize()} shared.", status.HTTP_201_CREATED
+        )
+
+
+class ReportListCreateView(AuthenticatedAPIView):
+    """
+    POST /api/social/reports/  {"content_type": "post"|"comment", "object_id", "reason", "description"}
+    GET  /api/social/reports/?status=pending   (moderators only)
+    """
+
+    throttle_classes = [ReportThrottle]
+
+    def get(self, request):
+        if not IsModerator().has_permission(request, self):
+            from rest_framework.exceptions import PermissionDenied
+
+            raise PermissionDenied("Only moderators can review reports.")
+        queryset = ContentReport.objects.select_related("reporter", "reviewed_by", "post", "comment")
+        status_filter = request.query_params.get("status")
+        if status_filter in ContentReport.Status.values:
+            queryset = queryset.filter(status=status_filter)
+        paginator = SocialPagination()
+        page = paginator.paginate_queryset(queryset, request, view=None)
+        return paginator.get_paginated_response(ReportModerationSerializer(page, many=True).data)
+
+    def post(self, request):
+        serializer = GenericReportWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = dict(serializer.validated_data)
+        content_type, object_id = data.pop("content_type"), data.pop("object_id")
+        if content_type == ContentReport.ContentType.POST:
+            target = {"post": services.get_post(request.user, object_id, write=True)}
+        else:
+            target = {"comment": services.get_comment(request.user, object_id, write=True)}
+        report = services.report_content(request.user, **target, **data)
+        return success_response(
+            {"report": ReportReceiptSerializer(report).data},
+            "Thank you. Your report was submitted and will be reviewed.",
+            status.HTTP_201_CREATED,
+        )
+
+
+class ReportModerationView(AuthenticatedAPIView):
+    """GET / PATCH /api/social/reports/<id>/  (moderators) {"status", "review_comments", "action": "none"|"content_removed"}"""
+
+    permission_classes = [IsAuthenticated, IsModerator]
+
+    def _get(self, report_id):
+        report = ContentReport.objects.select_related("reporter", "reviewed_by", "post", "comment").filter(pk=report_id).first()
+        if report is None:
+            from common.exceptions import ResourceNotFound
+
+            raise ResourceNotFound("This report does not exist.", code="report_not_found")
+        return report
+
+    def get(self, request, report_id):
+        return success_response({"report": ReportModerationSerializer(self._get(report_id)).data})
+
+    def patch(self, request, report_id):
+        self._get(report_id)
+        serializer = ReportReviewSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        services.review_report(request.user, report_id, **serializer.validated_data)
+        return success_response({"report": ReportModerationSerializer(self._get(report_id)).data}, "Report updated.")

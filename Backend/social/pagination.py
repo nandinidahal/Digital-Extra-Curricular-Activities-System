@@ -1,20 +1,13 @@
-from rest_framework.pagination import CursorPagination, PageNumberPagination
+"""One pagination shape for every list endpoint, wrapped in the project's envelope."""
+from common.pagination import StandardPagination
 
 
-class StandardPagination(PageNumberPagination):
-    page_size = 12
-    page_size_query_param = "page_size"
+class SocialPagination(StandardPagination):
+    """Shared page shape from common; Social keeps its smaller page sizes."""
+
+    page_size = 10
     max_page_size = 50
 
 
-class FeedCursorPagination(CursorPagination):
-    """Keyset pagination on (created_at, id): constant cost per page, no skipped/duplicated rows
-    when new posts arrive while the user is scrolling."""
-    ordering = ("-created_at", "-id")
+class CommentPagination(SocialPagination):
     page_size = 10
-    page_size_query_param = "page_size"
-    max_page_size = 30
-
-
-class NotificationCursorPagination(FeedCursorPagination):
-    page_size = 20

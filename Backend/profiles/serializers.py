@@ -1,221 +1,232 @@
-from django.contrib.auth import get_user_model
-from django.contrib.auth.validators import UnicodeUsernameValidator
-from django.db import IntegrityError, transaction
-from django.utils import timezone
+"""
+Serializers for the Profiles API.
+
+* `ProfileUpdateSerializer`  - input for PATCH /me/ (strict: unknown or protected keys -> 400)
+* `PrivacySerializer`        - input for PATCH /me/privacy/
+* `OwnProfileSerializer`     - output for the owner (everything, plus privacy and completion)
+* `ProfileViewSerializer`    - output for everybody else; hidden fields are REMOVED here,
+                               on the server, never left to the frontend.
+
+Every output serializer lists its fields explicitly, so a field added to the model
+later is never exposed by accident.
+"""
+from collections.abc import Mapping
+
 from rest_framework import serializers
 
-from accounts.validators import phone_validator, validate_date_of_birth
-from achievements.models import Visibility
+from . import services, validators
+from .models import Profile
+from .permissions import ADMIN
 
-from .models import UserProfile
-from .validators import process_profile_picture
+PRIVACY_FIELDS = (
+    "profile_visibility",
+    "show_institution",
+    "show_education",
+    "show_interests",
+    "show_skills",
+    "show_location",
+    "show_social_links",
+)
 
-User = get_user_model()
-
-
-def picture_url(profile, request):
-    if not profile.profile_picture:
-        return None
-    try:
-        url = profile.profile_picture.url
-    except ValueError:
-        return None
-    return request.build_absolute_uri(url) if request is not None else url
-
-
-# --------------------------------------------------------------------------- read side
-class PrivacySettingsSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = UserProfile
-        fields = ("profile_visibility", "email_visibility", "date_of_birth_visibility", "bio_visibility")
-        read_only_fields = fields
-
-
-class OwnerProfileSerializer(serializers.ModelSerializer):
-    """The complete profile, for its owner only. Passwords, hashes and token data never appear."""
-
-    id = serializers.IntegerField(source="user_id", read_only=True)
-    username = serializers.CharField(source="user.username", read_only=True)
-    full_name = serializers.CharField(source="user.full_name", read_only=True)
-    email = serializers.EmailField(source="user.email", read_only=True)
-    phone_number = serializers.CharField(source="user.phone_number", read_only=True)
-    country = serializers.CharField(source="user.country", read_only=True)
-    date_of_birth = serializers.DateField(source="user.date_of_birth", read_only=True)
-    role = serializers.CharField(source="user.role", read_only=True)
-    is_email_verified = serializers.BooleanField(source="user.is_email_verified", read_only=True)
-    account_created_at = serializers.DateTimeField(source="user.date_joined", read_only=True)
-    account_status = serializers.SerializerMethodField()
-    profile_picture_url = serializers.SerializerMethodField()
-    privacy = PrivacySettingsSerializer(source="*", read_only=True)
-
-    class Meta:
-        model = UserProfile
-        fields = (
-            "id", "username", "full_name", "email", "phone_number", "country", "date_of_birth", "bio",
-            "profile_picture_url", "role", "is_email_verified", "account_status", "account_created_at", "privacy",
-        )
-        read_only_fields = fields
-
-    def get_account_status(self, obj):
-        return "active" if obj.user.is_active else "deactivated"
-
-    def get_profile_picture_url(self, obj):
-        return picture_url(obj, self.context.get("request"))
+# output field -> privacy flag that must be True for others to see it
+FIELD_VISIBILITY = {
+    "institution": "show_institution",
+    "education_level": "show_education",
+    "field_of_study": "show_education",
+    "interests": "show_interests",
+    "skills": "show_skills",
+    "location": "show_location",
+    "website": "show_social_links",
+    "linkedin_url": "show_social_links",
+    "github_url": "show_social_links",
+    "portfolio_url": "show_social_links",
+}
 
 
-class PublicProfileSerializer(serializers.ModelSerializer):
-    """What other authenticated users see. Optional fields appear only if the owner allows it.
-
-    Only whitelisted fields are ever written to the output; phone number, country, role and
-    verification status are never part of it.
+# ---------------------------------------------------------------------------
+# Input
+# ---------------------------------------------------------------------------
+class StrictFieldsMixin:
     """
-
-    id = serializers.IntegerField(source="user_id", read_only=True)
-    username = serializers.CharField(source="user.username", read_only=True)
-    full_name = serializers.CharField(source="user.full_name", read_only=True)
-    member_since = serializers.DateTimeField(source="user.date_joined", read_only=True)
-    profile_picture_url = serializers.SerializerMethodField()
-
-    class Meta:
-        model = UserProfile
-        fields = ("id", "username", "full_name", "profile_picture_url", "member_since")
-        read_only_fields = fields
-
-    def get_profile_picture_url(self, obj):
-        return picture_url(obj, self.context.get("request"))
-
-    def to_representation(self, instance):
-        data = super().to_representation(instance)
-        if instance.bio_visibility == Visibility.PUBLIC:
-            data["bio"] = instance.bio
-        if instance.email_visibility == Visibility.PUBLIC:
-            data["email"] = instance.user.email
-        if instance.date_of_birth_visibility == Visibility.PUBLIC:
-            dob = instance.user.date_of_birth
-            data["date_of_birth"] = dob.isoformat() if dob else None
-        return data
-
-
-class AccountSerializer(serializers.ModelSerializer):
-    username = serializers.CharField(source="user.username", read_only=True)
-    email = serializers.EmailField(source="user.email", read_only=True)
-    is_email_verified = serializers.BooleanField(source="user.is_email_verified", read_only=True)
-    role = serializers.CharField(source="user.role", read_only=True)
-    account_status = serializers.SerializerMethodField()
-    account_created_at = serializers.DateTimeField(source="user.date_joined", read_only=True)
-    last_login = serializers.DateTimeField(source="user.last_login", read_only=True)
-    pending_email = serializers.SerializerMethodField()
-
-    class Meta:
-        model = UserProfile
-        fields = ("username", "email", "is_email_verified", "role", "account_status", "account_created_at",
-                  "last_login", "pending_email")
-        read_only_fields = fields
-
-    def get_account_status(self, obj):
-        return "active" if obj.user.is_active else "deactivated"
-
-    def get_pending_email(self, obj):
-        pending = getattr(obj.user, "pending_email_change", None)
-        if pending and pending.expires_at > timezone.now():
-            return pending.new_email
-        return None
-
-
-# --------------------------------------------------------------------------- write side
-class ProfileUpdateSerializer(serializers.Serializer):
-    """PUT: full_name and username are required. PATCH: send only what changes.
-
-    The account is always the authenticated user's; there is no user id in the payload.
-    The email address is NOT editable here: it changes through the verified flow
-    (/me/email/change/ + /me/email/confirm/).
+    Reject any key that is not a writable field of this serializer. DRF would
+    silently ignore unknown keys; here a client sending `role`, `email`, `user`
+    or `profile_picture` gets a clear 400 instead of a false "success".
     """
-
-    full_name = serializers.CharField(max_length=150)
-    username = serializers.CharField(max_length=150, validators=[UnicodeUsernameValidator()])
-    date_of_birth = serializers.DateField(required=False, validators=[validate_date_of_birth])
-    bio = serializers.CharField(required=False, allow_blank=True, max_length=500)
-    phone_number = serializers.CharField(required=False, validators=[phone_validator])
-    country = serializers.CharField(required=False, max_length=80)
-
-    def validate_username(self, value):
-        qs = User.objects.filter(username__iexact=value).exclude(pk=self.instance.user_id)
-        if qs.exists():
-            raise serializers.ValidationError("This username is already taken.")
-        return value
-
-    def validate(self, attrs):
-        submitted = self.initial_data.get("email") if hasattr(self.initial_data, "get") else None
-        if submitted is not None and str(submitted).strip().lower() != self.instance.user.email.lower():
-            raise serializers.ValidationError({
-                "email": ["Email cannot be changed here. Use POST /api/profile/me/email/change/ "
-                          "so the new address can be verified."]
-            })
-        return attrs
-
-    def update(self, profile, validated_data):
-        user = profile.user
-        user_fields = [f for f in ("full_name", "username", "date_of_birth", "phone_number", "country")
-                       if f in validated_data]
-        try:
-            with transaction.atomic():
-                for f in user_fields:
-                    setattr(user, f, validated_data[f])
-                if user_fields:
-                    user.save(update_fields=user_fields)
-                if "bio" in validated_data:
-                    profile.bio = validated_data["bio"]
-                    profile.save(update_fields=["bio", "updated_at"])
-        except IntegrityError:  # lost a race against another user taking the same username
-            raise serializers.ValidationError({"username": ["This username is already taken."]})
-        return profile
-
-
-class PrivacySettingsUpdateSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = UserProfile
-        fields = ("profile_visibility", "email_visibility", "date_of_birth_visibility", "bio_visibility")
 
     def to_internal_value(self, data):
-        unknown = sorted(set(data) - set(self.fields))
-        if unknown:
-            raise serializers.ValidationError({k: ["Unknown setting."] for k in unknown})
-        if not data:
-            raise serializers.ValidationError({"detail": ["Provide at least one setting to change."]})
+        if not isinstance(data, Mapping):
+            raise serializers.ValidationError({"non_field_errors": ["Expected a JSON object."]})
+        writable = {name for name, field in self.fields.items() if not field.read_only}
+        errors = {}
+        for key in data.keys():
+            if key not in writable:
+                errors[key] = ["This field cannot be set or changed here."]
+        if errors:
+            raise serializers.ValidationError(errors)
         return super().to_internal_value(data)
 
 
-class ProfilePictureUploadSerializer(serializers.Serializer):
-    profile_picture = serializers.FileField(allow_empty_file=False)
+class TagListField(serializers.ListField):
+    """List of short strings: trimmed, case-insensitively de-duplicated, order kept."""
 
-    def validate_profile_picture(self, upload):
-        from django.core.exceptions import ValidationError as DjangoValidationError
+    def __init__(self, **kwargs):
+        kwargs.setdefault("child", serializers.CharField(max_length=40, trim_whitespace=True))
+        kwargs.setdefault("allow_empty", True)
+        kwargs.setdefault("required", False)
+        super().__init__(**kwargs)
 
+    def to_internal_value(self, data):
+        if isinstance(data, str):  # a bare string would be split into characters
+            self.fail("not_a_list", input_type="str")
+        items = super().to_internal_value(data)
+        seen, unique = set(), []
+        for item in items:
+            key = item.casefold()
+            if key not in seen:
+                seen.add(key)
+                unique.append(item)
+        return unique
+
+
+def _text(max_length, *, validator=validators.validate_single_line):
+    return serializers.CharField(
+        max_length=max_length, required=False, allow_blank=True, validators=[validator]
+    )
+
+
+def _link(*extra_validators):
+    return serializers.CharField(
+        max_length=200,
+        required=False,
+        allow_blank=True,
+        validators=[validators.validate_web_url, *extra_validators],
+    )
+
+
+class ProfileUpdateSerializer(StrictFieldsMixin, serializers.Serializer):
+    headline = _text(120)
+    bio = _text(500, validator=validators.validate_multiline)
+    institution = _text(150)
+    education_level = serializers.ChoiceField(
+        choices=Profile.EducationLevel.choices, required=False, allow_blank=True
+    )
+    field_of_study = _text(150)
+    interests = TagListField(max_length=20)
+    skills = TagListField(max_length=30)
+    location = _text(100)
+    website = _link()
+    linkedin_url = _link(validators.validate_linkedin_url)
+    github_url = _link(validators.validate_github_url)
+    portfolio_url = _link()
+
+
+class PrivacySerializer(StrictFieldsMixin, serializers.Serializer):
+    profile_visibility = serializers.ChoiceField(choices=Profile.Visibility.choices, required=False)
+    show_institution = serializers.BooleanField(required=False)
+    show_education = serializers.BooleanField(required=False)
+    show_interests = serializers.BooleanField(required=False)
+    show_skills = serializers.BooleanField(required=False)
+    show_location = serializers.BooleanField(required=False)
+    show_social_links = serializers.BooleanField(required=False)
+
+
+class ImageUploadSerializer(serializers.Serializer):
+    """multipart/form-data with a single file field named `image`."""
+
+    image = serializers.FileField(allow_empty_file=False, use_url=False)
+
+    def validate(self, attrs):
+        field_name = self.context["field_name"]
+        attrs["image_format"] = services.validate_upload(attrs["image"], field_name)
+        return attrs
+
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+class _ProfileOutputBase(serializers.ModelSerializer):
+    user_id = serializers.UUIDField(read_only=True)
+    username = serializers.CharField(source="user.username", read_only=True)
+    full_name = serializers.CharField(source="user.full_name", read_only=True)
+    profile_picture = serializers.SerializerMethodField()
+    cover_photo = serializers.SerializerMethodField()
+
+    def _absolute_url(self, file_field):
+        if not file_field:
+            return None
         try:
-            return process_profile_picture(upload)
-        except DjangoValidationError as exc:
-            raise serializers.ValidationError(list(exc.messages))
+            url = file_field.url
+        except ValueError:
+            return None
+        request = self.context.get("request")
+        if request is not None and url.startswith("/"):
+            return request.build_absolute_uri(url)  # S3/CDN storages already return full URLs
+        return url
+
+    def get_profile_picture(self, obj):
+        return self._absolute_url(obj.profile_picture)
+
+    def get_cover_photo(self, obj):
+        return self._absolute_url(obj.cover_photo)
 
 
-class EmailChangeRequestSerializer(serializers.Serializer):
-    new_email = serializers.EmailField()
-    current_password = serializers.CharField(write_only=True, style={"input_type": "password"})
+class OwnProfileSerializer(_ProfileOutputBase):
+    privacy = serializers.SerializerMethodField()
+    profile_completion = serializers.SerializerMethodField()
+    is_owner = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Profile
+        fields = (
+            "id", "user_id", "username", "full_name",
+            "profile_picture", "cover_photo",
+            "headline", "bio", "institution", "education_level", "field_of_study",
+            "interests", "skills", "location",
+            "website", "linkedin_url", "github_url", "portfolio_url",
+            "privacy", "profile_completion", "is_owner",
+            "date_created", "updated_at",
+        )
+        read_only_fields = fields
+
+    def get_privacy(self, obj):
+        return {name: getattr(obj, name) for name in PRIVACY_FIELDS}
+
+    def get_profile_completion(self, obj):
+        return services.calculate_completion(obj)
+
+    def get_is_owner(self, obj):
+        return True
 
 
-class EmailChangeConfirmSerializer(serializers.Serializer):
-    otp = serializers.RegexField(r"^\d{6}$", error_messages={"invalid": "OTP must be exactly 6 digits."})
+class ProfileViewSerializer(_ProfileOutputBase):
+    """
+    What other people see. Context key `access` is the viewer level from
+    permissions.py; admins see every content field, everybody else only what
+    the owner allowed.
+    """
 
+    is_owner = serializers.SerializerMethodField()
 
-class DeactivateAccountSerializer(serializers.Serializer):
-    current_password = serializers.CharField(write_only=True, style={"input_type": "password"})
-    confirm = serializers.BooleanField()
+    class Meta:
+        model = Profile
+        fields = (
+            "user_id", "username", "full_name",
+            "profile_picture", "cover_photo",
+            "headline", "bio", "institution", "education_level", "field_of_study",
+            "interests", "skills", "location",
+            "website", "linkedin_url", "github_url", "portfolio_url",
+            "is_owner", "date_created",
+        )
+        read_only_fields = fields
 
-    def validate_confirm(self, value):
-        if value is not True:
-            raise serializers.ValidationError("You must confirm that you want to deactivate your account.")
-        return value
+    def get_is_owner(self, obj):
+        return False
 
-
-class ReactivateSerializer(serializers.Serializer):
-    identifier = serializers.CharField(help_text="Email or username")
-    password = serializers.CharField(write_only=True, style={"input_type": "password"})
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if self.context.get("access") == ADMIN:
+            return data
+        for field_name, flag in FIELD_VISIBILITY.items():
+            if not getattr(instance, flag):
+                data.pop(field_name, None)
+        return data

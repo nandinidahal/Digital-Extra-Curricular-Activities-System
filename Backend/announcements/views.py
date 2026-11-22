@@ -1,265 +1,351 @@
-import mimetypes
-import os
+"""
+API of the Announcements module.
 
-from django.db import IntegrityError, transaction
-from django.http import FileResponse, Http404
-from django.shortcuts import get_object_or_404
-from rest_framework import generics, serializers, status
+Public (no login):   GET /api/announcements/public/, GET /api/announcements/<id>/,
+                     GET /api/announcements/slug/<slug>/, GET /api/categories/
+Everything else needs a JWT. Visitors calling an authenticated endpoint get 401.
+"""
+from rest_framework import status
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
-from rest_framework.permissions import SAFE_METHODS, IsAuthenticated
-from rest_framework.response import Response
-from rest_framework.reverse import reverse
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.views import APIView
 
-from . import filters, ranking, selectors
-from .models import AnnouncementStatus, Bookmark, Category
-from .pagination import StandardPagination
-from .permissions import IsAnnouncementOwnerOrReadOnly
-from .serializers import (AnnouncementDetailSerializer, AnnouncementPreviewSerializer,
-                          AnnouncementWriteSerializer, CategorySerializer)
-
-PARSERS = [MultiPartParser, FormParser, JSONParser]
-
-
-class AnnouncementFeedView(generics.ListAPIView):
-    """Shared list behaviour: validated params -> filters -> search -> sort/rank -> pagination."""
-
-    serializer_class = AnnouncementPreviewSerializer
-    pagination_class = StandardPagination
-    default_sort = "latest"
-    force_sort = False        # ignore ?sort=
-    force_ranking = False     # always use the recommendation score
-    require_query = False     # ?q= mandatory (search endpoint)
-
-    def base_queryset(self):
-        return selectors.public_queryset(self.request.user)
-
-    def scope(self, qs, params):
-        return qs
-
-    def list(self, request, *args, **kwargs):
-        ser = filters.AnnouncementQuerySerializer(data=request.query_params)
-        ser.is_valid(raise_exception=True)
-        params = ser.validated_data
-        if self.require_query and not filters.search_terms(params.get("q")):
-            raise serializers.ValidationError({"q": ["This query parameter is required."]})
-
-        qs = filters.apply_filters(self.scope(self.base_queryset(), params), params)
-        qs, searched = filters.apply_search(qs, params.get("q"))
-        sort = self.default_sort if self.force_sort else params.get("sort", self.default_sort)
-
-        if self.force_ranking or (sort == "relevant" and not searched):
-            items = ranking.rank(qs, request.user)
-        else:
-            items = filters.apply_sort(qs, sort, searched=searched)
-        page = self.paginate_queryset(items)
-        data = self.get_serializer(page, many=True).data
-        return self.get_paginated_response(data)
-
-
-class AnnouncementListCreateView(AnnouncementFeedView):
-    """GET: all published announcements (filter/search/sort). POST: create (author = request.user)."""
-
-    parser_classes = PARSERS
-
-    def post(self, request, *args, **kwargs):
-        ser = AnnouncementWriteSerializer(data=request.data, context=self.get_serializer_context())
-        ser.is_valid(raise_exception=True)
-        obj = ser.save()
-        obj = selectors.visible_queryset(request.user).get(pk=obj.pk)
-        return Response(AnnouncementDetailSerializer(obj, context=self.get_serializer_context()).data,
-                        status=status.HTTP_201_CREATED)
-
-
-class LatestAnnouncementsView(AnnouncementFeedView):
-    force_sort = True
-    default_sort = "latest"
-
-
-class FeaturedAnnouncementsView(AnnouncementFeedView):
-    def scope(self, qs, params):
-        return qs.filter(is_featured=True)
-
-
-class ImportantAnnouncementsView(AnnouncementFeedView):
-    def scope(self, qs, params):
-        return qs.filter(is_important=True)
-
-
-class RecommendedAnnouncementsView(AnnouncementFeedView):
-    force_ranking = True
-
-
-class UpcomingEventsView(AnnouncementFeedView):
-    default_sort = "event_date"
-
-    def scope(self, qs, params):
-        return qs.filter(selectors.upcoming_event_q())
-
-
-class UpcomingDeadlinesView(AnnouncementFeedView):
-    default_sort = "deadline"
-
-    def scope(self, qs, params):
-        return qs.filter(selectors.upcoming_deadline_q())
-
-
-class SearchAnnouncementsView(AnnouncementFeedView):
-    require_query = True
-    default_sort = "relevant"
-
-
-class AuthorAnnouncementsView(AnnouncementFeedView):
-    """Published announcements of one student (never their drafts, not even for the author)."""
-
-    def scope(self, qs, params):
-        return qs.filter(published_by_id=self.kwargs["user_id"])
-
-
-class MyAnnouncementsView(AnnouncementFeedView):
-    """The authenticated student's own announcements in every state (?state=draft|scheduled|...)."""
-
-    default_sort = "updated"
-
-    def base_queryset(self):
-        return selectors.owned_queryset(self.request.user)
-
-    def scope(self, qs, params):
-        return qs.filter(selectors.state_q(params["state"])) if "state" in params else qs
-
-
-class MyDraftsView(MyAnnouncementsView):
-    def scope(self, qs, params):
-        return qs.filter(status=AnnouncementStatus.DRAFT)
-
-
-class BookmarkedAnnouncementsView(AnnouncementFeedView):
-    """Only the requesting student's own bookmarks."""
-
-    default_sort = "bookmarked"
-    force_sort = True
-
-    def base_queryset(self):
-        return selectors.bookmarked_queryset(self.request.user)
-
-
-class CategoryListView(generics.ListAPIView):
-    serializer_class = CategorySerializer
-    pagination_class = None
-    queryset = Category.objects.filter(is_active=True)
-
-
-class AnnouncementDetailView(generics.RetrieveUpdateDestroyAPIView):
-    """GET: any student may read a live announcement (owner also drafts/scheduled/expired);
-    anything else is a 404. PUT/PATCH/DELETE: author only (403 for everybody else)."""
-
-    permission_classes = [IsAuthenticated, IsAnnouncementOwnerOrReadOnly]
-    parser_classes = PARSERS
-
-    def get_queryset(self):
-        return selectors.visible_queryset(self.request.user)
-
-    def get_serializer_class(self):
-        return AnnouncementDetailSerializer if self.request.method in SAFE_METHODS else AnnouncementWriteSerializer
-
-    def update(self, request, *args, **kwargs):
-        instance = self.get_object()
-        ser = AnnouncementWriteSerializer(instance, data=request.data, partial=kwargs.pop("partial", False),
-                                          context=self.get_serializer_context())
-        ser.is_valid(raise_exception=True)
-        ser.save()
-        fresh = self.get_queryset().get(pk=instance.pk)
-        return Response(AnnouncementDetailSerializer(fresh, context=self.get_serializer_context()).data)
-
-
-class SharedAnnouncementView(generics.RetrieveAPIView):
-    """Open an announcement through its non-guessable share_id (still requires login)."""
-
-    serializer_class = AnnouncementDetailSerializer
-    lookup_field = "share_id"
-
-    def get_queryset(self):
-        return selectors.visible_queryset(self.request.user)
-
-
-class ShareInfoView(APIView):
-    def get(self, request, pk):
-        obj = get_object_or_404(selectors.visible_queryset(request.user), pk=pk)
-        if obj.state != "published":
-            return Response({"detail": "Only published announcements can be shared."},
-                            status=status.HTTP_400_BAD_REQUEST)
-        return Response({
-            "id": obj.pk,
-            "share_id": obj.share_id,
-            "detail_url": reverse("announcement-detail", args=[obj.pk], request=request),
-            "shared_url": reverse("announcement-shared", args=[obj.share_id], request=request),
-        })
-
-
-class BookmarkView(APIView):
-    """GET: am I bookmarking it? POST: bookmark (201, or 200 if it already was). DELETE: remove (204)."""
-
-    def _announcement(self, request, pk):
-        return get_object_or_404(selectors.public_queryset(request.user), pk=pk)
-
-    def get(self, request, pk):
-        self._announcement(request, pk)
-        return Response({"bookmarked": Bookmark.objects.filter(user=request.user, announcement_id=pk).exists()})
-
-    def post(self, request, pk):
-        obj = self._announcement(request, pk)
-        try:
-            with transaction.atomic():
-                _, created = Bookmark.objects.get_or_create(user=request.user, announcement=obj)
-        except IntegrityError:  # lost a race against a parallel request: the row exists
-            created = False
-        count = Bookmark.objects.filter(announcement=obj).count()
-        return Response({"bookmarked": True, "bookmark_count": count},
-                        status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
-
-    def delete(self, request, pk):
-        deleted, _ = Bookmark.objects.filter(user=request.user, announcement_id=pk).delete()
-        if not deleted:
-            self._announcement(request, pk)  # 404 for unknown / not-visible ids, 204 otherwise
-        return Response(status=status.HTTP_204_NO_CONTENT)
-
-
-class AttachmentDownloadView(APIView):
-    """Private attachments are only served to users who may see the announcement."""
-
-    def get(self, request, pk):
-        obj = get_object_or_404(selectors.visible_queryset(request.user), pk=pk)
-        if not obj.attachment:
-            raise Http404
-        try:
-            handle = obj.attachment.open("rb")
-        except (FileNotFoundError, OSError):
-            raise Http404
-        name = obj.attachment_name or os.path.basename(obj.attachment.name)
-        response = FileResponse(handle, as_attachment=True, filename=name,
-                                content_type=mimetypes.guess_type(name)[0] or "application/octet-stream")
-        response["X-Content-Type-Options"] = "nosniff"
-        return response
-
-
-class LandingView(APIView):
-    """One call for the landing page: previews for every section (real records only)."""
+from accounts.responses import success_response
+from common.exceptions import check_content_length
+from common.pagination import StandardPagination, paginate
+from common.relationships import hidden_user_ids
+from common.permissions import IsAdminRole, IsModerator, ReadAnyWriteAuthenticated, is_admin
+from profiles.authentication import OptionalJWTAuthentication
+
+from . import services
+from .models import Announcement, AnnouncementReport, Category
+from .serializers import (
+    AnnouncementCardSerializer,
+    AnnouncementDetailSerializer,
+    AnnouncementFilterSerializer,
+    AnnouncementWriteSerializer,
+    BookmarkSerializer,
+    CategorySerializer,
+    ReportModerationSerializer,
+    ReportReceiptSerializer,
+    ReportReviewSerializer,
+    ReportWriteSerializer,
+)
+from .throttles import (
+    AnnouncementInteractionThrottle,
+    AnnouncementReportThrottle,
+    AnnouncementSearchThrottle,
+    AnnouncementWriteThrottle,
+)
+
+UPLOAD_BODY_LIMIT = 6 * 1024 * 1024 + 256 * 1024
+
+
+def _filters(request, *, allowed=None):
+    params = request.query_params
+    if allowed is not None:
+        params = {k: v for k, v in params.items() if k in allowed}
+    serializer = AnnouncementFilterSerializer(data=params)
+    serializer.is_valid(raise_exception=True)
+    return serializer.validated_data
+
+
+def _detail(request, announcement_id, message="", status_code=status.HTTP_200_OK):
+    announcement = services.with_relations(Announcement.objects.filter(pk=announcement_id), request.user).get()
+    return success_response(
+        {"announcement": AnnouncementDetailSerializer(announcement, context={"request": request}).data},
+        message, status_code,
+    )
+
+
+class _Authenticated(APIView):
+    permission_classes = [IsAuthenticated]
+
+
+# ---------------------------------------------------------------------------
+# Listings
+# ---------------------------------------------------------------------------
+class PublicAnnouncementListView(APIView):
+    """
+    GET /api/announcements/public/  (no login needed)
+    Published PUBLIC announcements only. Filters: category, activity_type, when, ordering.
+    Text search is reserved for logged-in users (/search/).
+    """
+
+    authentication_classes = [OptionalJWTAuthentication]
+    permission_classes = [AllowAny]
 
     def get(self, request):
-        lim = serializers.IntegerField(min_value=1, max_value=12, required=False, default=6)
-        limit = lim.run_validation(request.query_params.get("limit", 6))
-        ctx = {"request": request}
-        base = selectors.public_queryset(request.user)
+        params = _filters(request, allowed={"category", "activity_type", "when", "ordering", "registration_open"})
+        queryset = services.public_announcements()
+        hidden = hidden_user_ids(request.user)
+        if hidden:
+            queryset = queryset.exclude(author_id__in=hidden)
+        queryset = services.with_relations(services.apply_filters(queryset, params, allow_search=False), request.user)
+        return paginate(request, queryset, AnnouncementCardSerializer)
 
-        def preview(items):
-            return AnnouncementPreviewSerializer(list(items)[:limit], many=True, context=ctx).data
 
-        newest = filters.apply_sort(base, "latest")
-        return Response({
-            "featured": preview(filters.apply_sort(base.filter(is_featured=True), "latest")[:limit]),
-            "latest": preview(newest[:limit]),
-            "recommended": preview(ranking.rank(base, request.user)[:limit]),
-            "upcoming_events": preview(filters.apply_sort(base.filter(selectors.upcoming_event_q()), "event_date")[:limit]),
-            "upcoming_deadlines": preview(filters.apply_sort(base.filter(selectors.upcoming_deadline_q()), "deadline")[:limit]),
-            "important": preview(filters.apply_sort(base.filter(is_important=True), "latest")[:limit]),
-        })
+class AnnouncementListCreateView(APIView):
+    """
+    GET  /api/announcements/   (login) published announcements the user may see, with filters
+    POST /api/announcements/   (login) create; JSON or multipart (cover_image). status=draft|published
+    """
+
+    authentication_classes = [OptionalJWTAuthentication]
+    permission_classes = [IsAuthenticated]
+    parser_classes = [JSONParser, MultiPartParser, FormParser]
+    throttle_classes = [AnnouncementWriteThrottle]
+
+    def get(self, request):
+        params = _filters(request)
+        if params.get("status") and not is_admin(request.user):
+            params.pop("status")  # status filtering of other people's content is admin-only
+        if is_admin(request.user) and params.get("status"):
+            queryset = Announcement.objects.all()
+        else:
+            queryset = services.visible_announcements(request.user)
+        queryset = services.with_relations(services.apply_filters(queryset, params, allow_search=True), request.user)
+        return paginate(request, queryset, AnnouncementCardSerializer)
+
+    def post(self, request):
+        check_content_length(request, UPLOAD_BODY_LIMIT)
+        serializer = AnnouncementWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = dict(serializer.validated_data)
+        cover = data.pop("cover_image", None)
+        data.pop("remove_cover_image", None)
+        publish = data.pop("status", "draft") == "published"
+        announcement = services.create_announcement(request.user, data, cover=cover, publish=publish)
+        return _detail(
+            request, announcement.pk,
+            "Announcement published." if publish else "Announcement saved as draft.", status.HTTP_201_CREATED,
+        )
+
+
+class AnnouncementSearchView(_Authenticated):
+    """GET /api/announcements/search/?q=robotics&category=technology&when=upcoming&ordering=start"""
+
+    throttle_classes = [AnnouncementSearchThrottle]
+
+    def get(self, request):
+        params = _filters(request)
+        params.pop("status", None)  # search only ever covers published announcements
+        queryset = services.visible_announcements(request.user)
+        queryset = services.with_relations(services.apply_filters(queryset, params, allow_search=True), request.user)
+        return paginate(request, queryset, AnnouncementCardSerializer)
+
+
+class MyAnnouncementsView(_Authenticated):
+    """GET /api/announcements/me/[drafts|published|archived]/  -> own announcements, any status"""
+
+    status_filter = None
+
+    def get(self, request):
+        params = _filters(request)
+        queryset = services.own_announcements(request.user)
+        if self.status_filter:
+            params["status"] = self.status_filter
+        if "ordering" not in params:
+            params["ordering"] = "updated"
+        queryset = services.with_relations(services.apply_filters(queryset, params, allow_search=True), request.user)
+        return paginate(request, queryset, AnnouncementCardSerializer)
+
+
+# ---------------------------------------------------------------------------
+# Single announcement
+# ---------------------------------------------------------------------------
+class AnnouncementDetailView(APIView):
+    """GET (public where visibility allows) / PATCH (owner) / DELETE (owner or moderator)"""
+
+    authentication_classes = [OptionalJWTAuthentication]
+    permission_classes = [ReadAnyWriteAuthenticated]
+    parser_classes = [JSONParser, MultiPartParser, FormParser]
+    throttle_classes = [AnnouncementWriteThrottle]
+
+    def get(self, request, announcement_id):
+        announcement = services.get_visible_announcement(request.user, announcement_id)
+        return success_response(
+            {"announcement": AnnouncementDetailSerializer(announcement, context={"request": request}).data}
+        )
+
+    def patch(self, request, announcement_id):
+        check_content_length(request, UPLOAD_BODY_LIMIT)
+        services.get_visible_announcement(request.user, announcement_id, annotated=False)  # 404 before 403
+        serializer = AnnouncementWriteSerializer(data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        data = dict(serializer.validated_data)
+        cover = data.pop("cover_image", None)
+        remove_cover = data.pop("remove_cover_image", False)
+        services.update_announcement(request.user, announcement_id, data, cover=cover, remove_cover=remove_cover)
+        return _detail(request, announcement_id, "Announcement updated.")
+
+    def delete(self, request, announcement_id):
+        services.get_visible_announcement(request.user, announcement_id, annotated=False)
+        services.delete_announcement(request.user, announcement_id)
+        return success_response(message="Announcement deleted.")
+
+
+class AnnouncementBySlugView(APIView):
+    authentication_classes = [OptionalJWTAuthentication]
+    permission_classes = [AllowAny]
+
+    def get(self, request, slug):
+        announcement = services.get_visible_by_slug(request.user, slug)
+        return success_response(
+            {"announcement": AnnouncementDetailSerializer(announcement, context={"request": request}).data}
+        )
+
+
+class _LifecycleView(_Authenticated):
+    throttle_classes = [AnnouncementWriteThrottle]
+    action = None
+    message = ""
+
+    def post(self, request, announcement_id):
+        services.get_visible_announcement(request.user, announcement_id, annotated=False)
+        getattr(services, self.action)(request.user, announcement_id)
+        return _detail(request, announcement_id, self.message)
+
+
+class PublishView(_LifecycleView):
+    action, message = "publish_announcement", "Announcement published."
+
+
+class ArchiveView(_LifecycleView):
+    action, message = "archive_announcement", "Announcement archived."
+
+
+class RestoreView(_LifecycleView):
+    action, message = "restore_announcement", "Announcement restored as a draft."
+
+
+# ---------------------------------------------------------------------------
+# Bookmarks
+# ---------------------------------------------------------------------------
+class BookmarkView(_Authenticated):
+    """POST bookmark (201 new / 200 existing), DELETE remove (200, idempotent)."""
+
+    throttle_classes = [AnnouncementInteractionThrottle]
+
+    def post(self, request, announcement_id):
+        _bookmark, created = services.bookmark(request.user, announcement_id)
+        return success_response(
+            {"announcement_id": str(announcement_id), "is_bookmarked": True},
+            "Announcement bookmarked." if created else "Already bookmarked.",
+            status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
+
+    def delete(self, request, announcement_id):
+        services.remove_bookmark(request.user, announcement_id)
+        return success_response({"announcement_id": str(announcement_id), "is_bookmarked": False}, "Bookmark removed.")
+
+
+class BookmarkListView(_Authenticated):
+    """GET /api/announcements/bookmarks/  -> only the requesting user's bookmarks"""
+
+    def get(self, request):
+        paginator = StandardPagination()
+        page = paginator.paginate_queryset(services.user_bookmarks(request.user), request, view=None)
+        ids = [b.announcement_id for b in page]
+        visible = services.with_relations(services.visible_announcements(request.user).filter(pk__in=ids), request.user)
+        cards = {a.pk: AnnouncementCardSerializer(a, context={"request": request}).data for a in visible}
+        return paginator.get_paginated_response(BookmarkSerializer(page, many=True, context={"cards": cards}).data)
+
+
+# ---------------------------------------------------------------------------
+# Reports and moderation
+# ---------------------------------------------------------------------------
+class ReportCreateView(_Authenticated):
+    throttle_classes = [AnnouncementReportThrottle]
+
+    def post(self, request, announcement_id):
+        serializer = ReportWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        report = services.report(request.user, announcement_id, **serializer.validated_data)
+        return success_response(
+            {"report": ReportReceiptSerializer(report).data},
+            "Thank you. Your report was submitted and will be reviewed.", status.HTTP_201_CREATED,
+        )
+
+
+class ReportListView(APIView):
+    """GET /api/announcements/reports/?status=pending  (moderators only)"""
+
+    permission_classes = [IsAuthenticated, IsModerator]
+
+    def get(self, request):
+        queryset = AnnouncementReport.objects.select_related("announcement", "reporter", "reviewed_by")
+        status_filter = request.query_params.get("status")
+        if status_filter in AnnouncementReport.Status.values:
+            queryset = queryset.filter(status=status_filter)
+        return paginate(request, queryset, ReportModerationSerializer)
+
+
+class ReportDetailView(APIView):
+    permission_classes = [IsAuthenticated, IsModerator]
+
+    def _get(self, report_id):
+        report = AnnouncementReport.objects.select_related("announcement", "reporter", "reviewed_by").filter(pk=report_id).first()
+        if report is None:
+            from common.exceptions import ResourceNotFound
+
+            raise ResourceNotFound("This report does not exist.", code="report_not_found")
+        return report
+
+    def get(self, request, report_id):
+        return success_response({"report": ReportModerationSerializer(self._get(report_id)).data})
+
+    def patch(self, request, report_id):
+        self._get(report_id)
+        serializer = ReportReviewSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        services.review_report(request.user, report_id, **serializer.validated_data)
+        return success_response({"report": ReportModerationSerializer(self._get(report_id)).data}, "Report updated.")
+
+
+# ---------------------------------------------------------------------------
+# Categories (/api/categories/)
+# ---------------------------------------------------------------------------
+class CategoryListCreateView(APIView):
+    """GET active categories (anyone; admins may add ?include_inactive=true). POST: admins only."""
+
+    authentication_classes = [OptionalJWTAuthentication]
+
+    def get_permissions(self):
+        return [AllowAny()] if self.request.method == "GET" else [IsAuthenticated(), IsAdminRole()]
+
+    def get(self, request):
+        queryset = Category.objects.all()
+        include_inactive = request.query_params.get("include_inactive") in ("1", "true")
+        if not (include_inactive and is_admin(request.user)):
+            queryset = queryset.filter(is_active=True)
+        return success_response({"results": CategorySerializer(queryset, many=True).data})
+
+    def post(self, request):
+        serializer = CategorySerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return success_response({"category": serializer.data}, "Category created.", status.HTTP_201_CREATED)
+
+
+class CategoryDetailView(APIView):
+    permission_classes = [IsAuthenticated, IsAdminRole]
+
+    def _get(self, category_id):
+        category = Category.objects.filter(pk=category_id).first()
+        if category is None:
+            from common.exceptions import ResourceNotFound
+
+            raise ResourceNotFound("This category does not exist.", code="category_not_found")
+        return category
+
+    def patch(self, request, category_id):
+        serializer = CategorySerializer(self._get(category_id), data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return success_response({"category": serializer.data}, "Category updated.")
+
+    def delete(self, request, category_id):
+        outcome = services.delete_or_deactivate_category(self._get(category_id))
+        message = "Category deleted." if outcome == "deleted" else "Category is in use and was deactivated instead."
+        return success_response({"result": outcome}, message)

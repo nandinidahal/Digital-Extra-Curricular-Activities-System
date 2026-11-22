@@ -1,674 +1,599 @@
-import io
-import shutil
-import tempfile
+"""Announcements module tests (user-based creation, lifecycle, visibility, search, bookmarks, reports)."""
 from datetime import timedelta
+from unittest import mock
 
-from django.core.files.uploadedfile import SimpleUploadedFile
-from django.core.management import call_command
-from django.db import IntegrityError, transaction
-from django.test import TestCase, override_settings
-from django.urls import reverse
 from django.utils import timezone
-from PIL import Image
-from rest_framework.test import APIClient, APITestCase
 
-from accounts.models import Role, User
-from accounts.services import tokens_for_user
-from announcements import ranking
-from announcements.models import Announcement, AnnouncementStatus, Bookmark, Category
+from announcements import services
+from announcements.models import Announcement, AnnouncementBookmark, AnnouncementReport, Category
+from common.testing import DEASTestCase
+from notifications.models import Notification
 
-TMP_MEDIA = tempfile.mkdtemp(prefix="ann_test_media_")
-TMP_PRIVATE = tempfile.mkdtemp(prefix="ann_test_private_")
+BASE = "/api/announcements/"
 
 
-def mk_user(name, role=Role.USER):
-    return User.objects.create_user(
-        username=name, email=f"{name}@example.com", password="Str0ng!Passw0rd", full_name=name.title(),
-        phone_number="+9779800000000", country="Nepal", role=role)
+def future(days=7, hours=0):
+    return timezone.now() + timedelta(days=days, hours=hours)
 
 
-def png_file(name="pic.png", size=(8, 8)):
-    buf = io.BytesIO()
-    Image.new("RGB", size, "red").save(buf, "PNG")
-    return SimpleUploadedFile(name, buf.getvalue(), content_type="image/png")
-
-
-def pdf_file(name="rules.pdf"):
-    return SimpleUploadedFile(name, b"%PDF-1.4\n%fake but valid header\n", content_type="application/pdf")
-
-
-@override_settings(MEDIA_ROOT=TMP_MEDIA, ANNOUNCEMENT_PRIVATE_ROOT=TMP_PRIVATE,
-                   ROOT_URLCONF="announcements.tests.urls")
-class Base(APITestCase):
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-
-    @classmethod
-    def tearDownClass(cls):
-        super().tearDownClass()
-        shutil.rmtree(TMP_MEDIA, ignore_errors=True)
-        shutil.rmtree(TMP_PRIVATE, ignore_errors=True)
-
+class AnnouncementTestCase(DEASTestCase):
     def setUp(self):
-        call_command("seed_announcement_categories", stdout=io.StringIO())
-        self.sports = Category.objects.get(name="Sports")
-        self.arts = Category.objects.get(name="Cultural Activities")
-        self.general = Category.objects.get(name="General Notice")
-        self.a, self.b, self.c = mk_user("alice"), mk_user("bob"), mk_user("carol")
-        self.coord = mk_user("coach", role=Role.COORDINATOR)
+        super().setUp()
+        self.tech = Category.objects.get(slug="technology")
+        self.sports = Category.objects.get(slug="sports")
 
-    # helpers ---------------------------------------------------------------------------
-    def as_user(self, user):
-        client = APIClient()
-        client.force_authenticate(user)
-        return client
-
-    def make(self, author, **over):
-        data = dict(title="Football Cup", short_description="short", full_description="Full text here",
-                    category=self.sports, published_by=author, status=AnnouncementStatus.PUBLISHED,
-                    published_at=timezone.now())
-        data.update(over)
-        return Announcement.objects.create(**data)
-
-    def payload(self, **over):
-        data = {"title": "Inter-college football cup", "full_description": "Register your team now.",
-                "category": self.sports.id, "status": "published", "location": "Main ground"}
-        data.update(over)
+    def payload(self, **extra):
+        data = {
+            "title": "Robotics Workshop",
+            "short_description": "Build a robot in a day",
+            "description": "Hands-on robotics workshop for beginners.",
+            "category": str(self.tech.pk),
+            "activity_type": "physical",
+            "organizer_name": "Robotics Club",
+            "organizer_email": "club@example.com",
+            "organizer_phone": "+977 1 5551234",
+            "location": "Hall A, Kathmandu",
+            "start_datetime": future(10).isoformat(),
+            "end_datetime": future(10, 4).isoformat(),
+            "registration_deadline": future(8).isoformat(),
+            "registration_link": "https://example.com/register",
+            "eligibility_criteria": "Students aged 15+",
+            "requirements": "Laptop",
+        }
+        data.update(extra)
         return data
 
-    def ids(self, resp):
-        return [r["id"] for r in resp.data["results"]]
+    def make(self, author=None, *, status="published", visibility="public", **extra):
+        fields = dict(
+            author=author or self.alice, title=extra.pop("title", "Hackathon"), slug=extra.pop("slug", None),
+            short_description="Short", description="Long description", category=extra.pop("category", self.tech),
+            activity_type="physical", location=extra.pop("location", "Kathmandu"), start_datetime=extra.pop("start", future(5)),
+            status=status, visibility=visibility,
+            published_at=timezone.now() if status == "published" else None,
+        )
+        fields.update(extra)
+        if fields["slug"] is None:
+            import uuid
+
+            fields["slug"] = f"a-{uuid.uuid4().hex[:10]}"
+        return Announcement.objects.create(**fields)
+
+    def url(self, announcement, action=""):
+        return f"{BASE}{announcement.pk}/{action + '/' if action else ''}"
 
 
-# ================================================================ CRUD, ownership, visibility
-class OwnershipTests(Base):
-    def test_01_student_a_creates_announcement(self):
-        r = self.as_user(self.a).post(reverse("announcement-list"), self.payload(
-            activity_name="Football Cup 2026", start_date=(timezone.localdate() + timedelta(days=10)).isoformat(),
-            deadline=(timezone.localdate() + timedelta(days=5)).isoformat()), format="json")
-        self.assertEqual(r.status_code, 201, r.data)
-        obj = Announcement.objects.get(pk=r.data["id"])
-        self.assertEqual(obj.published_by, self.a)
-        self.assertEqual(r.data["author"]["username"], "alice")
-        self.assertNotIn("email", r.data["author"])
-        self.assertTrue(r.data["is_owner"])
-        self.assertTrue(obj.short_description)           # derived from the full description
-        self.assertIsNotNone(obj.published_at)
+class CreationTests(AnnouncementTestCase):
+    def test_authenticated_user_creates_draft_and_becomes_author(self):
+        self.login(self.alice)
+        data = self.assertOk(self.client.post(BASE, self.payload(), format="json"), 201)["announcement"]
+        self.assertEqual(data["status"], "draft")
+        self.assertEqual(data["author"]["id"], str(self.alice.pk))
+        announcement = Announcement.objects.get(pk=data["id"])
+        self.assertEqual(announcement.author, self.alice)
+        self.assertIsNone(announcement.published_at)
 
-    def test_02_and_03_other_students_see_list_and_full_details(self):
-        ann = self.make(self.a)
-        for user in (self.b, self.c):
-            client = self.as_user(user)
-            self.assertIn(ann.id, self.ids(client.get(reverse("announcement-list"))))
-            d = client.get(reverse("announcement-detail", args=[ann.id]))
-            self.assertEqual(d.status_code, 200)
-            self.assertEqual(d.data["full_description"], "Full text here")
-            self.assertFalse(d.data["can_edit"])
-            self.assertEqual(d.data["author"]["id"], self.a.id)
+    def test_regular_user_does_not_need_admin_role(self):
+        self.assertEqual(self.bob.role, "user")
+        self.login(self.bob)
+        self.assertOk(self.client.post(BASE, self.payload(status="published"), format="json"), 201)
 
-    def test_04_other_student_cannot_edit(self):
-        ann = self.make(self.a)
-        url = reverse("announcement-detail", args=[ann.id])
-        for method in ("put", "patch"):
-            r = getattr(self.as_user(self.b), method)(url, self.payload(title="Hacked title"), format="json")
-            self.assertEqual(r.status_code, 403)
-        ann.refresh_from_db()
-        self.assertEqual(ann.title, "Football Cup")
+    def test_visitor_cannot_create(self):
+        self.assertError(self.client.post(BASE, self.payload(), format="json"), 401)
 
-    def test_05_other_student_cannot_delete(self):
-        ann = self.make(self.a)
-        r = self.as_user(self.b).delete(reverse("announcement-detail", args=[ann.id]))
-        self.assertEqual(r.status_code, 403)
-        self.assertTrue(Announcement.objects.filter(pk=ann.id).exists())
+    def test_cannot_assign_author_or_protected_fields(self):
+        self.login(self.alice)
+        for field, value in (("author", str(self.bob.pk)), ("published_at", timezone.now().isoformat()),
+                             ("slug", "x"), ("is_edited", True), ("archived_by", str(self.bob.pk))):
+            with self.subTest(field=field):
+                body = self.assertError(self.client.post(BASE, self.payload(**{field: value}), format="json"), 400, "validation_error")
+                self.assertIn(field, body["errors"])
+        self.assertFalse(Announcement.objects.exists())
 
-    def test_06_owner_can_edit(self):
-        ann = self.make(self.a)
-        url = reverse("announcement-detail", args=[ann.id])
-        r = self.as_user(self.a).patch(url, {"title": "Updated title", "location": "Hall 2"}, format="json")
-        self.assertEqual(r.status_code, 200, r.data)
-        self.assertEqual(r.data["title"], "Updated title")
-        r = self.as_user(self.a).put(url, self.payload(title="Full replace"), format="json")
-        self.assertEqual(r.status_code, 200, r.data)
-        ann.refresh_from_db()
-        self.assertEqual(ann.title, "Full replace")
-        self.assertEqual(ann.published_by, self.a)
+    def test_create_published_directly(self):
+        self.login(self.alice)
+        data = self.assertOk(self.client.post(BASE, self.payload(status="published"), format="json"), 201)["announcement"]
+        self.assertEqual(data["status"], "published")
+        self.assertIsNotNone(data["published_at"])
 
-    def test_07_owner_can_delete(self):
-        ann = self.make(self.a)
-        r = self.as_user(self.a).delete(reverse("announcement-detail", args=[ann.id]))
-        self.assertEqual(r.status_code, 204)
-        self.assertFalse(Announcement.objects.filter(pk=ann.id).exists())
-        self.assertEqual(self.as_user(self.b).get(reverse("announcement-detail", args=[ann.id])).status_code, 404)
+    def test_status_archived_not_allowed_on_create(self):
+        self.login(self.alice)
+        self.assertError(self.client.post(BASE, self.payload(status="archived"), format="json"), 400)
 
-    def test_22_cannot_impersonate_author(self):
-        client = self.as_user(self.a)
-        r = client.post(reverse("announcement-list"),
-                        self.payload(published_by=self.b.id, author=self.b.id, user=self.b.id), format="json")
-        self.assertEqual(r.status_code, 201)
-        self.assertEqual(Announcement.objects.get(pk=r.data["id"]).published_by, self.a)
-        r = client.patch(reverse("announcement-detail", args=[r.data["id"]]),
-                         {"published_by": self.b.id, "author": self.b.id}, format="json")
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(Announcement.objects.get(pk=r.data["id"]).published_by, self.a)
+    def test_title_required(self):
+        self.login(self.alice)
+        body = self.assertError(self.client.post(BASE, self.payload(title="   "), format="json"), 400)
+        self.assertIn("title", body["errors"])
 
-    def test_bookmarking_does_not_grant_edit_rights(self):
-        ann = self.make(self.a)
-        client = self.as_user(self.b)
-        self.assertEqual(client.post(reverse("announcement-bookmark", args=[ann.id])).status_code, 201)
-        self.assertEqual(client.patch(reverse("announcement-detail", args=[ann.id]), {"title": "x y z"}, format="json").status_code, 403)
-        self.assertEqual(client.delete(reverse("announcement-detail", args=[ann.id])).status_code, 403)
+    def test_draft_may_be_incomplete_but_publish_validates(self):
+        self.login(self.alice)
+        data = self.assertOk(self.client.post(BASE, {"title": "Idea"}, format="json"), 201)["announcement"]
+        body = self.assertError(self.client.post(f"{BASE}{data['id']}/publish/"), 400, "validation_error")
+        for field in ("short_description", "description", "category", "start_datetime", "location"):
+            self.assertIn(field, body["errors"])
 
+    def test_inactive_category_rejected_for_new_announcements(self):
+        self.tech.is_active = False
+        self.tech.save()
+        self.login(self.alice)
+        body = self.assertError(self.client.post(BASE, self.payload(), format="json"), 400)
+        self.assertIn("category", body["errors"])
 
-class AuthTests(Base):
-    def test_09_unauthenticated_cannot_do_anything(self):
-        ann = self.make(self.a)
-        anon = APIClient()
-        checks = [
-            anon.get(reverse("announcement-list")), anon.post(reverse("announcement-list"), self.payload(), format="json"),
-            anon.get(reverse("announcement-detail", args=[ann.id])), anon.patch(reverse("announcement-detail", args=[ann.id]), {}, format="json"),
-            anon.delete(reverse("announcement-detail", args=[ann.id])), anon.post(reverse("announcement-bookmark", args=[ann.id])),
-            anon.get(reverse("announcement-bookmarks")), anon.get(reverse("announcement-search") + "?q=a"),
-            anon.get(reverse("announcement-recommended")), anon.get(reverse("announcement-landing")),
-            anon.get(reverse("announcement-categories")), anon.get(reverse("announcement-attachment", args=[ann.id])),
-        ]
-        for r in checks:
-            self.assertEqual(r.status_code, 401, r.request["PATH_INFO"])
+    def test_existing_announcement_keeps_deactivated_category(self):
+        announcement = self.make()
+        self.tech.is_active = False
+        self.tech.save()
+        self.login(self.alice)
+        self.assertOk(self.client.patch(self.url(announcement), {"title": "New title"}, format="json"))
+        announcement.refresh_from_db()
+        self.assertEqual(announcement.category, self.tech)
 
-    def test_real_jwt_from_existing_auth_system_works(self):
-        access = tokens_for_user(self.a)["access"]
-        client = APIClient()
-        client.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
-        r = client.post(reverse("announcement-list"), self.payload(), format="json")
-        self.assertEqual(r.status_code, 201)
-        self.assertEqual(Announcement.objects.get(pk=r.data["id"]).published_by, self.a)
+    def test_html_and_script_links_rejected(self):
+        self.login(self.alice)
+        for field, value in (("description", "<script>alert(1)</script>"), ("registration_link", "javascript:alert(1)"),
+                             ("online_link", "ftp://example.com"), ("title", "two\nlines")):
+            with self.subTest(field=field):
+                body = self.assertError(self.client.post(BASE, self.payload(**{field: value}), format="json"), 400)
+                self.assertIn(field, body["errors"])
+
+    def test_email_and_phone_validated(self):
+        self.login(self.alice)
+        self.assertIn("organizer_email", self.assertError(self.client.post(BASE, self.payload(organizer_email="nope"), format="json"), 400)["errors"])
+        self.assertIn("organizer_phone", self.assertError(self.client.post(BASE, self.payload(organizer_phone="call me"), format="json"), 400)["errors"])
 
 
-class VisibilityTests(Base):
-    def test_08_drafts_are_private(self):
-        draft = self.make(self.a, status=AnnouncementStatus.DRAFT, published_at=None, title="Secret draft")
-        b = self.as_user(self.b)
-        self.assertEqual(b.get(reverse("announcement-detail", args=[draft.id])).status_code, 404)
-        self.assertEqual(b.patch(reverse("announcement-detail", args=[draft.id]), {"title": "nope nope"}, format="json").status_code, 404)
-        self.assertEqual(b.delete(reverse("announcement-detail", args=[draft.id])).status_code, 404)
-        self.assertEqual(b.post(reverse("announcement-bookmark", args=[draft.id])).status_code, 404)
-        self.assertEqual(b.get(reverse("announcement-attachment", args=[draft.id])).status_code, 404)
-        self.assertNotIn(draft.id, self.ids(b.get(reverse("announcement-list"))))
-        self.assertNotIn(draft.id, self.ids(b.get(reverse("announcement-by-author", args=[self.a.id]))))
-        self.assertNotIn(draft.id, self.ids(b.get(reverse("announcement-search") + "?q=secret")))
-        self.assertNotIn(draft.id, self.ids(b.get(reverse("announcement-recommended"))))
-        self.assertEqual(b.get(reverse("announcement-share", args=[draft.id])).status_code, 404)
-        # owner sees it in the right places only
-        a = self.as_user(self.a)
-        self.assertEqual(a.get(reverse("announcement-detail", args=[draft.id])).status_code, 200)
-        self.assertIn(draft.id, self.ids(a.get(reverse("announcement-drafts"))))
-        self.assertIn(draft.id, self.ids(a.get(reverse("announcement-mine"))))
-        self.assertNotIn(draft.id, self.ids(a.get(reverse("announcement-list"))))
-        self.assertEqual(self.ids(b.get(reverse("announcement-drafts"))), [])
-
-    def test_scheduled_hidden_until_publication_time_and_expired_excluded(self):
-        scheduled = self.make(self.a, published_at=timezone.now() + timedelta(days=2), title="Soon")
-        expired = self.make(self.a, expires_at=timezone.now() - timedelta(hours=1), title="Old news")
-        live = self.make(self.a, title="Live one")
-        b = self.as_user(self.b)
-        listed = self.ids(b.get(reverse("announcement-list")))
-        self.assertEqual(listed, [live.id])
-        self.assertEqual(b.get(reverse("announcement-detail", args=[scheduled.id])).status_code, 404)
-        self.assertEqual(b.get(reverse("announcement-detail", args=[expired.id])).status_code, 404)
-        a = self.as_user(self.a)
-        self.assertEqual(a.get(reverse("announcement-detail", args=[scheduled.id])).data["state"], "scheduled")
-        self.assertEqual(a.get(reverse("announcement-detail", args=[expired.id])).data["state"], "expired")
-        self.assertEqual(self.ids(a.get(reverse("announcement-mine") + "?state=scheduled")), [scheduled.id])
-        self.assertEqual(self.ids(a.get(reverse("announcement-mine") + "?state=expired")), [expired.id])
-
-    def test_author_listing(self):
-        mine, theirs = self.make(self.a), self.make(self.b, title="Bobs")
-        r = self.as_user(self.c).get(reverse("announcement-by-author", args=[self.a.id]))
-        self.assertEqual(self.ids(r), [mine.id])
-        r = self.as_user(self.c).get(reverse("announcement-list") + f"?author={self.b.id}")
-        self.assertEqual(self.ids(r), [theirs.id])
-        self.assertEqual(self.ids(self.as_user(self.a).get(reverse("announcement-mine"))), [mine.id])
-
-    def test_publish_flow_draft_to_published_and_back(self):
-        client = self.as_user(self.a)
-        r = client.post(reverse("announcement-list"), self.payload(status="draft"), format="json")
-        self.assertEqual(r.data["state"], "draft")
-        self.assertIsNone(r.data["published_at"])
-        url = reverse("announcement-detail", args=[r.data["id"]])
-        self.assertEqual(self.as_user(self.b).get(url).status_code, 404)
-        r = client.patch(url, {"status": "published"}, format="json")
-        self.assertEqual(r.data["state"], "published")
-        self.assertEqual(self.as_user(self.b).get(url).status_code, 200)
-        client.patch(url, {"status": "draft"}, format="json")
-        self.assertEqual(self.as_user(self.b).get(url).status_code, 404)
-
-    def test_scheduled_publish_via_api(self):
-        when = (timezone.now() + timedelta(days=1)).isoformat()
-        r = self.as_user(self.a).post(reverse("announcement-list"), self.payload(publish_at=when), format="json")
-        self.assertEqual(r.status_code, 201, r.data)
-        self.assertEqual(r.data["state"], "scheduled")
-        self.assertEqual(self.as_user(self.b).get(reverse("announcement-detail", args=[r.data["id"]])).status_code, 404)
-
-
-# ================================================================ search / filter / sort / pagination
-class SearchFilterSortTests(Base):
+class DateAndActivityValidationTests(AnnouncementTestCase):
     def setUp(self):
         super().setUp()
-        today = timezone.localdate()
-        now = timezone.now()
-        self.football = self.make(self.a, title="Inter-college Football Cup", activity_name="Kathmandu Cup",
-                                  location="Dhangadhi Stadium", keywords="soccer, league",
-                                  start_date=today + timedelta(days=10), deadline=today + timedelta(days=3),
-                                  published_at=now - timedelta(days=3))
-        self.dance = self.make(self.b, title="Folk Dance Night", category=self.arts, full_description="Traditional dances",
-                               location="Auditorium", start_date=today + timedelta(days=4),
-                               published_at=now - timedelta(days=2))
-        self.chess = self.make(self.c, title="Chess workshop", category=self.general, full_description="Learn openings and endgames",
-                               deadline=today + timedelta(days=1), published_at=now - timedelta(days=1))
-        self.draft = self.make(self.a, title="Football draft only", status=AnnouncementStatus.DRAFT, published_at=None)
+        self.login(self.alice)
 
-    def search(self, q, user=None, extra=""):
-        return self.as_user(user or self.c).get(reverse("announcement-search") + f"?q={q}{extra}")
+    def test_end_before_start_rejected(self):
+        body = self.assertError(self.client.post(BASE, self.payload(end_datetime=future(9).isoformat()), format="json"), 400)
+        self.assertIn("end_datetime", body["errors"])
 
-    def test_10_search_across_students(self):
-        self.assertEqual(self.ids(self.search("football")), [self.football.id])            # title
-        self.assertEqual(self.ids(self.search("FOOT")), [self.football.id])                 # partial + case-insensitive
-        self.assertEqual(self.ids(self.search("traditional")), [self.dance.id])             # description
-        self.assertEqual(self.ids(self.search("sports")), [self.football.id])               # category name
-        self.assertEqual(self.ids(self.search("stadium")), [self.football.id])              # location
-        self.assertEqual(self.ids(self.search("soccer")), [self.football.id])               # keywords
-        self.assertEqual(self.ids(self.search("kathmandu")), [self.football.id])            # event name
-        self.assertEqual(self.ids(self.search("college%20cup")), [self.football.id])        # multiple words (AND)
-        self.assertEqual(self.ids(self.search("football%20chess")), [])                     # all words must match
-        self.assertEqual(self.ids(self.search("draft")), [])                                # drafts never match
-        self.assertEqual(self.search("zzzz").data["count"], 0)
+    def test_deadline_after_start_rejected(self):
+        body = self.assertError(self.client.post(BASE, self.payload(registration_deadline=future(11).isoformat()), format="json"), 400)
+        self.assertIn("registration_deadline", body["errors"])
 
-    def test_search_requires_query_and_is_injection_safe(self):
-        self.assertEqual(self.as_user(self.a).get(reverse("announcement-search")).status_code, 400)
-        r = self.search("%27%3B%20DROP%20TABLE%20announcements_announcement%3B--")
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.data["count"], 0)
-        self.assertEqual(Announcement.objects.count(), 4)
+    def test_past_event_cannot_be_published(self):
+        payload = self.payload(start_datetime=(timezone.now() - timedelta(days=2)).isoformat(),
+                               end_datetime=(timezone.now() - timedelta(days=1)).isoformat(),
+                               registration_deadline=(timezone.now() - timedelta(days=3)).isoformat(), status="published")
+        self.assertIn("start_datetime", self.assertError(self.client.post(BASE, payload, format="json"), 400)["errors"])
 
-    def test_search_relevance_prefers_title_matches(self):
-        weak = self.make(self.b, title="Gathering", full_description="football mentioned only in the body",
-                         published_at=timezone.now())
-        r = self.search("football")
-        self.assertEqual(self.ids(r), [self.football.id, weak.id])
+    def test_physical_requires_location(self):
+        body = self.assertError(self.client.post(BASE, self.payload(location="", status="published"), format="json"), 400)
+        self.assertIn("location", body["errors"])
 
-    def test_11_category_filters(self):
-        c = self.as_user(self.a)
-        self.assertEqual(self.ids(c.get(reverse("announcement-list") + f"?category={self.arts.id}")), [self.dance.id])
-        self.assertEqual(self.ids(c.get(reverse("announcement-list") + f"?category={self.sports.slug}")), [self.football.id])
-        self.assertEqual(self.ids(self.search("a", extra=f"&category={self.general.id}")), [self.chess.id])  # combined with search
-        self.assertEqual(c.get(reverse("announcement-list") + "?category=999999").data["count"], 0)
+    def test_online_requires_link(self):
+        body = self.assertError(self.client.post(BASE, self.payload(activity_type="online", location="", status="published"), format="json"), 400)
+        self.assertIn("online_link", body["errors"])
+        self.assertOk(self.client.post(BASE, self.payload(activity_type="online", location="", online_link="https://meet.example.com/x", status="published"), format="json"), 201)
 
-    def test_12_sorting(self):
-        c = self.as_user(self.a)
-        url = reverse("announcement-list")
-        self.assertEqual(self.ids(c.get(url + "?sort=latest")), [self.chess.id, self.dance.id, self.football.id])
-        self.assertEqual(self.ids(c.get(url + "?sort=oldest")), [self.football.id, self.dance.id, self.chess.id])
-        self.assertEqual(self.ids(c.get(url)), [self.chess.id, self.dance.id, self.football.id])   # default = latest
-        self.assertEqual(self.ids(c.get(url + "?sort=event_date")), [self.dance.id, self.football.id, self.chess.id])
-        self.assertEqual(self.ids(c.get(url + "?sort=deadline")), [self.chess.id, self.football.id, self.dance.id])
-        Bookmark.objects.create(user=self.b, announcement=self.football)
-        Bookmark.objects.create(user=self.c, announcement=self.football)
-        Bookmark.objects.create(user=self.c, announcement=self.dance)
-        r = c.get(url + "?sort=bookmarks")
-        self.assertEqual(self.ids(r), [self.football.id, self.dance.id, self.chess.id])
-        self.assertEqual([x["bookmark_count"] for x in r.data["results"]], [2, 1, 0])
-        self.assertEqual(self.ids(c.get(url + "?sort=latest&category=%s" % self.sports.id)), [self.football.id])  # sort + filter
+    def test_hybrid_requires_both(self):
+        body = self.assertError(self.client.post(BASE, self.payload(activity_type="hybrid", location="", status="published"), format="json"), 400)
+        self.assertIn("location", body["errors"])
+        self.assertIn("online_link", body["errors"])
 
-    def test_filters_dates_featured_and_events(self):
-        today = timezone.localdate()
-        past = self.make(self.a, title="Past gala", start_date=today - timedelta(days=5), end_date=today - timedelta(days=4),
-                         published_at=timezone.now() - timedelta(days=9))
-        featured = self.make(self.coord, title="Featured thing", is_featured=True)
-        c = self.as_user(self.c)
-        url = reverse("announcement-list")
-        self.assertEqual(self.ids(c.get(url + "?event=past")), [past.id])
-        self.assertEqual(set(self.ids(c.get(url + "?event=upcoming"))), {self.football.id, self.dance.id})
-        self.assertEqual(set(self.ids(c.get(url + "?deadline=upcoming"))), {self.football.id, self.chess.id})
-        self.assertEqual(self.ids(c.get(url + "?featured=true")), [featured.id])
-        self.assertNotIn(featured.id, self.ids(c.get(url + "?featured=false")))
-        frm = (today + timedelta(days=8)).isoformat()
-        to = (today + timedelta(days=12)).isoformat()
-        self.assertEqual(self.ids(c.get(url + f"?event_from={frm}&event_to={to}")), [self.football.id])
-        d = (timezone.localdate() - timedelta(days=2)).isoformat()
-        r = c.get(url + f"?published_from={d}&published_to={timezone.localdate().isoformat()}")
-        self.assertIn(self.dance.id, self.ids(r))
-        self.assertNotIn(self.football.id, self.ids(r))
-
-    def test_21_invalid_query_params_rejected(self):
-        c = self.as_user(self.a)
-        url = reverse("announcement-list")
-        for bad in ("?sort=bogus", "?event=sometime", "?published_from=notadate", "?author=abc",
-                    "?featured=maybe", "?event_from=2030-02-01&event_to=2030-01-01", "?activity_type=xyz"):
-            self.assertEqual(c.get(url + bad).status_code, 400, bad)
-
-    def test_20_pagination(self):
-        for i in range(15):
-            self.make(self.a, title=f"Bulk {i:02d}", published_at=timezone.now() + timedelta(seconds=-100 + i))
-        c = self.as_user(self.b)
-        url = reverse("announcement-list")
-        r = c.get(url)
-        self.assertEqual((r.data["count"], len(r.data["results"])), (18, 12))
-        self.assertIsNotNone(r.data["next"])
-        r = c.get(url + "?page_size=5&page=3")
-        self.assertEqual(len(r.data["results"]), 5)
-        seen = []
-        for page in range(1, 5):
-            seen += self.ids(c.get(url + f"?page_size=5&page={page}"))
-        self.assertEqual(len(seen), len(set(seen)), "no duplicates across pages")
-        self.assertEqual(len(seen), 18)
-        self.assertEqual(c.get(url + "?page_size=5&page=9").status_code, 404)
-        self.assertLessEqual(len(c.get(url + "?page_size=500").data["results"]), 50)
-
-    def test_14_15_upcoming_events_exclude_expired(self):
-        today = timezone.localdate()
-        past = self.make(self.a, title="Over already", start_date=today - timedelta(days=3), end_date=today - timedelta(days=1))
-        ongoing = self.make(self.a, title="Ongoing fest", start_date=today - timedelta(days=1), end_date=today + timedelta(days=2))
-        r = self.as_user(self.b).get(reverse("announcement-upcoming"))
-        self.assertEqual(self.ids(r), [ongoing.id, self.dance.id, self.football.id])   # soonest first, ongoing counts
-        self.assertNotIn(past.id, self.ids(r))
-        self.assertNotIn(self.chess.id, self.ids(r))                                    # no event date
-        self.assertNotIn(self.draft.id, self.ids(r))
-
-    def test_16_upcoming_deadlines_exclude_passed(self):
-        today = timezone.localdate()
-        passed = self.make(self.a, title="Closed", deadline=today - timedelta(days=1))
-        r = self.as_user(self.b).get(reverse("announcement-deadlines"))
-        self.assertEqual(self.ids(r), [self.chess.id, self.football.id])                # nearest first
-        self.assertNotIn(passed.id, self.ids(r))
-
-    def test_featured_important_latest_endpoints_and_categories(self):
-        f = self.make(self.coord, title="Pinned", is_featured=True)
-        imp = self.make(self.coord, title="Notice", is_important=True)
-        c = self.as_user(self.a)
-        self.assertEqual(self.ids(c.get(reverse("announcement-featured"))), [f.id])
-        self.assertEqual(self.ids(c.get(reverse("announcement-important"))), [imp.id])
-        self.assertEqual(self.ids(c.get(reverse("announcement-latest")))[:2], [imp.id, f.id])
-        cats = c.get(reverse("announcement-categories"))
-        self.assertEqual(cats.status_code, 200)
-        self.assertEqual(len(cats.data), 12)
+    def test_invalid_activity_type_and_visibility(self):
+        self.assertIn("activity_type", self.assertError(self.client.post(BASE, self.payload(activity_type="virtual"), format="json"), 400)["errors"])
+        self.assertIn("visibility", self.assertError(self.client.post(BASE, self.payload(visibility="secret"), format="json"), 400)["errors"])
 
 
-# ================================================================ ranking
-class RankingTests(Base):
+class CoverImageTests(AnnouncementTestCase):
+    def test_valid_cover_accepted_and_reencoded(self):
+        self.login(self.alice)
+        payload = self.payload()
+        payload["cover_image"] = self.image_file("JPEG")
+        data = self.assertOk(self.client.post(BASE, payload, format="multipart"), 201)["announcement"]
+        self.assertTrue(data["cover_image"].startswith("http://testserver/media/announcements/covers/"))
+        self.assertEqual(len(self.files_in(self.media_root)), 1)
+
+    def test_invalid_cover_rejected(self):
+        self.login(self.alice)
+        for upload in (self.image_file("GIF"), self.pdf_file("cover.pdf")):
+            with self.subTest(upload=upload.name):
+                payload = self.payload()
+                payload["cover_image"] = upload
+                body = self.assertError(self.client.post(BASE, payload, format="multipart"), 400)
+                self.assertIn("cover_image", body["errors"])
+        self.assertEqual(self.files_in(self.media_root), [])
+
+    def test_replace_and_remove_cover_cleans_old_files(self):
+        self.login(self.alice)
+        payload = self.payload()
+        payload["cover_image"] = self.image_file("PNG")
+        with self.captureOnCommitCallbacks(execute=True):
+            announcement_id = self.assertOk(self.client.post(BASE, payload, format="multipart"), 201)["announcement"]["id"]
+        with self.captureOnCommitCallbacks(execute=True):
+            self.assertOk(self.client.patch(f"{BASE}{announcement_id}/", {"cover_image": self.image_file("WEBP")}, format="multipart"))
+        files = self.files_in(self.media_root)
+        self.assertEqual(len(files), 1)
+        self.assertTrue(files[0].endswith(".webp"))
+        with self.captureOnCommitCallbacks(execute=True):
+            data = self.assertOk(self.client.patch(f"{BASE}{announcement_id}/", {"remove_cover_image": True}, format="json"))
+        self.assertIsNone(data["announcement"]["cover_image"])
+        self.assertEqual(self.files_in(self.media_root), [])
+
+
+class VisibilityTests(AnnouncementTestCase):
+    def test_draft_invisible_to_visitors_and_others(self):
+        draft = self.make(status="draft")
+        self.assertError(self.client.get(self.url(draft)), 404)
+        self.login(self.bob)
+        self.assertError(self.client.get(self.url(draft)), 404)
+        self.assertNotIn(str(draft.pk), self.ids(self.assertOk(self.client.get(BASE))))
+        self.login(self.alice)
+        self.assertOk(self.client.get(self.url(draft)))
+
+    def test_published_public_visible_without_login(self):
+        announcement = self.make()
+        data = self.assertOk(self.client.get(self.url(announcement)))["announcement"]
+        self.assertEqual(data["title"], "Hackathon")
+        self.assertIn(str(announcement.pk), self.ids(self.assertOk(self.client.get(f"{BASE}public/"))))
+        self.assertOk(self.client.get(f"{BASE}slug/{announcement.slug}/"))
+
+    def test_members_only_requires_login(self):
+        announcement = self.make(visibility="members_only")
+        self.assertError(self.client.get(self.url(announcement)), 401, "authentication_required")
+        self.assertNotIn(str(announcement.pk), self.ids(self.assertOk(self.client.get(f"{BASE}public/"))))
+        self.login(self.bob)
+        self.assertOk(self.client.get(self.url(announcement)))
+        self.assertIn(str(announcement.pk), self.ids(self.assertOk(self.client.get(BASE))))
+
+    def test_private_only_author_and_admin(self):
+        announcement = self.make(visibility="private")
+        self.assertError(self.client.get(self.url(announcement)), 404)
+        self.login(self.bob)
+        self.assertError(self.client.get(self.url(announcement)), 404)
+        self.assertNotIn(str(announcement.pk), self.ids(self.assertOk(self.client.get(BASE))))
+        for user in (self.alice, self.admin):
+            self.login(user)
+            self.assertOk(self.client.get(self.url(announcement)))
+
+    def test_archived_not_in_public_listings(self):
+        announcement = self.make(status="archived")
+        self.assertNotIn(str(announcement.pk), self.ids(self.assertOk(self.client.get(f"{BASE}public/"))))
+        self.assertError(self.client.get(self.url(announcement)), 404)
+        self.login(self.bob)
+        self.assertNotIn(str(announcement.pk), self.ids(self.assertOk(self.client.get(BASE))))
+
+    def test_inactive_author_hidden(self):
+        announcement = self.make()
+        self.alice.is_active = False
+        self.alice.save()
+        self.assertError(self.client.get(self.url(announcement)), 404)
+
+    def test_blocked_users_do_not_see_each_others_announcements(self):
+        announcement = self.make()
+        self.block(self.alice, self.bob)
+        self.login(self.bob)
+        self.assertError(self.client.get(self.url(announcement)), 404)
+        self.assertNotIn(str(announcement.pk), self.ids(self.assertOk(self.client.get(BASE))))
+        self.assertNotIn(str(announcement.pk), self.ids(self.assertOk(self.client.get(f"{BASE}public/"))))
+
+    def test_private_organizer_info_not_exposed(self):
+        announcement = self.make(organizer_email="org@example.com", organizer_phone="+977 1234567",
+                                 contact_information="Call Ram", online_link="https://meet.example.com/abc")
+        visitor = self.assertOk(self.client.get(self.url(announcement)))["announcement"]
+        for field in ("organizer_email", "organizer_phone", "contact_information", "online_link"):
+            self.assertIsNone(visitor[field], field)
+        self.assertTrue(visitor["contact_details_hidden"])
+        self.assertTrue(visitor["requires_login_for_online_link"])
+        self.assertNotIn("org@example.com", str(self.client.get(f"{BASE}public/").content))
+        self.login(self.bob)
+        member = self.assertOk(self.client.get(self.url(announcement)))["announcement"]
+        self.assertIsNone(member["organizer_email"])
+        self.assertEqual(member["online_link"], "https://meet.example.com/abc")
+        announcement.show_contact_details = True
+        announcement.save()
+        member = self.assertOk(self.client.get(self.url(announcement)))["announcement"]
+        self.assertEqual(member["organizer_email"], "org@example.com")
+        self.login(self.alice)
+        own = self.assertOk(self.client.get(self.url(announcement)))["announcement"]
+        self.assertEqual(own["organizer_phone"], "+977 1234567")
+
+    def test_uuid_guessing_returns_404(self):
+        import uuid
+
+        self.assertError(self.client.get(f"{BASE}{uuid.uuid4()}/"), 404, "announcement_not_found")
+
+
+class OwnershipAndLifecycleTests(AnnouncementTestCase):
+    def test_owner_can_edit_and_edited_flag_set_after_publication(self):
+        announcement = self.make()
+        self.login(self.alice)
+        data = self.assertOk(self.client.patch(self.url(announcement), {"title": "Hackathon 2.0"}, format="json"))["announcement"]
+        self.assertEqual(data["title"], "Hackathon 2.0")
+        self.assertTrue(data["is_edited"])
+
+    def test_other_user_cannot_edit_delete_publish_or_archive(self):
+        announcement = self.make()
+        draft = self.make(status="draft")
+        self.login(self.bob)
+        self.assertError(self.client.patch(self.url(announcement), {"title": "Hacked"}, format="json"), 403, "not_owner")
+        self.assertError(self.client.delete(self.url(announcement)), 403, "not_owner")
+        self.assertError(self.client.post(self.url(announcement, "archive")), 403, "not_owner")
+        self.assertError(self.client.post(self.url(draft, "publish")), 404)
+        announcement.refresh_from_db()
+        self.assertEqual((announcement.title, announcement.status), ("Hackathon", "published"))
+
+    def test_status_cannot_be_changed_by_patch(self):
+        announcement = self.make(status="draft")
+        self.login(self.alice)
+        self.assertError(self.client.patch(self.url(announcement), {"status": "published"}, format="json"), 400)
+
+    def test_publish_archive_restore_cycle(self):
+        self.login(self.alice)
+        announcement_id = self.assertOk(self.client.post(BASE, self.payload(), format="json"), 201)["announcement"]["id"]
+        url = f"{BASE}{announcement_id}/"
+        self.assertEqual(self.assertOk(self.client.post(url + "publish/"))["announcement"]["status"], "published")
+        self.assertEqual(self.assertOk(self.client.post(url + "publish/"))["announcement"]["status"], "published")  # idempotent
+        self.assertEqual(self.assertOk(self.client.post(url + "archive/"))["announcement"]["status"], "archived")
+        self.assertError(self.client.patch(url, {"title": "x"}, format="json"), 400, "announcement_archived")
+        self.assertError(self.client.post(url + "publish/"), 400, "invalid_status_transition")
+        self.assertEqual(self.assertOk(self.client.post(url + "restore/"))["announcement"]["status"], "draft")
+        self.assertError(self.client.post(url + "restore/"), 400, "invalid_status_transition")
+
+    def test_owner_can_delete(self):
+        announcement = self.make()
+        self.login(self.alice)
+        self.assertOk(self.client.delete(self.url(announcement)))
+        self.assertFalse(Announcement.objects.filter(pk=announcement.pk).exists())
+
+    def test_moderator_can_archive_and_delete_but_not_edit(self):
+        announcement = self.make()
+        self.login(self.admin)
+        self.assertError(self.client.patch(self.url(announcement), {"title": "x"}, format="json"), 403)
+        with self.captureOnCommitCallbacks(execute=True):
+            self.assertOk(self.client.post(self.url(announcement, "archive")))
+        announcement.refresh_from_db()
+        self.assertEqual(announcement.archived_by, self.admin)
+        self.assertTrue(Notification.objects.filter(recipient=self.alice, notification_type="announcement.archived").exists())
+        self.login(self.coordinator)
+        self.assertOk(self.client.delete(self.url(announcement)))
+
+    def test_my_announcement_lists(self):
+        draft, published, archived = self.make(status="draft"), self.make(), self.make(status="archived")
+        self.make(self.bob)
+        self.login(self.alice)
+        self.assertEqual(set(self.ids(self.assertOk(self.client.get(f"{BASE}me/")))), {str(draft.pk), str(published.pk), str(archived.pk)})
+        self.assertEqual(self.ids(self.assertOk(self.client.get(f"{BASE}me/drafts/"))), [str(draft.pk)])
+        self.assertEqual(self.ids(self.assertOk(self.client.get(f"{BASE}me/published/"))), [str(published.pk)])
+        self.assertEqual(self.ids(self.assertOk(self.client.get(f"{BASE}me/archived/"))), [str(archived.pk)])
+        self.logout()
+        self.assertError(self.client.get(f"{BASE}me/"), 401)
+
+
+class SearchAndFilterTests(AnnouncementTestCase):
     def setUp(self):
         super().setUp()
-        self.now = timezone.now()
-        self.t = self.now - timedelta(days=2)       # shared timestamp so only the boost decides
-        self.today = timezone.localdate()
+        self.robotics = self.make(title="Robotics Bootcamp", location="Pokhara", start=future(3))
+        self.football = self.make(self.bob, title="Football Cup", category=self.sports, start=future(20))
+        self.past = self.make(title="Old Robotics Meetup", start=timezone.now() - timedelta(days=3),
+                              end_datetime=timezone.now() - timedelta(days=2))
+        self.secret = self.make(self.bob, title="Robotics secret", visibility="private")
+        self.draft = self.make(self.bob, title="Robotics draft", status="draft")
 
-    def rec(self, user=None, **extra):
-        return self.as_user(user or self.c).get(reverse("announcement-recommended") + extra.get("qs", ""))
+    def search(self, query):
+        return set(self.ids(self.assertOk(self.client.get(f"{BASE}search/{query}"))))
 
-    def order(self, resp):
-        return [r["title"] for r in resp.data["results"]]
+    def test_search_requires_login(self):
+        self.assertError(self.client.get(f"{BASE}search/?q=robotics"), 401)
 
-    def test_13_components_unit(self):
-        n, t = self.now, self.today
-        self.assertAlmostEqual(ranking.recency_score(n, n), 1.0)
-        self.assertAlmostEqual(ranking.recency_score(n - timedelta(days=7), n), 0.5, places=4)
-        self.assertGreater(ranking.recency_score(n - timedelta(hours=1), n), ranking.recency_score(n - timedelta(days=5), n))
-        self.assertEqual(ranking.event_score(None, None, t), 0.0)
-        self.assertEqual(ranking.event_score(t - timedelta(days=3), t - timedelta(days=1), t), 0.0)   # over
-        self.assertEqual(ranking.event_score(t - timedelta(days=1), t + timedelta(days=1), t), 1.0)   # ongoing
-        self.assertGreater(ranking.event_score(t + timedelta(days=1), None, t), ranking.event_score(t + timedelta(days=20), None, t))
-        self.assertEqual(ranking.event_score(t + timedelta(days=60), None, t), 0.0)
-        self.assertEqual(ranking.deadline_score(None, t), 0.0)
-        self.assertEqual(ranking.deadline_score(t - timedelta(days=1), t), 0.0)
-        self.assertEqual(ranking.deadline_score(t, t), 1.0)
-        self.assertEqual(ranking.engagement_score(0, 5), 0.0)
-        self.assertEqual(ranking.engagement_score(5, 5), 1.0)
-        self.assertEqual(ranking.engagement_score(3, 0), 0.0)
-        self.assertAlmostEqual(sum(ranking.WEIGHTS.values()), 1.0)
-        for v in (ranking.recency_score(n - timedelta(days=900), n), ranking.event_score(t, t, t)):
-            self.assertTrue(0.0 <= v <= 1.0)
+    def test_search_respects_visibility(self):
+        self.login(self.carol)
+        self.assertEqual(self.search("?q=robotics"), {str(self.robotics.pk), str(self.past.pk)})
 
-    def test_13_recent_beats_old_and_new_with_no_engagement_is_not_hidden(self):
-        old = self.make(self.a, title="Old", published_at=self.now - timedelta(days=60))
-        popular_old = self.make(self.a, title="Popular old", published_at=self.now - timedelta(days=40))
-        for u in (self.a, self.b, self.coord):
-            Bookmark.objects.create(user=u, announcement=popular_old)
-        fresh = self.make(self.b, title="Fresh", published_at=self.now - timedelta(hours=1))
-        r = self.rec()
-        self.assertEqual(self.order(r)[0], "Fresh")
-        self.assertIn("score", r.data["results"][0])
-        self.assertLess(self.order(r).index("Popular old"), self.order(r).index("Old"))
+    def test_public_listing_ignores_text_search(self):
+        ids = set(self.ids(self.assertOk(self.client.get(f"{BASE}public/?q=football"))))
+        self.assertIn(str(self.robotics.pk), ids)
 
-    def test_13_event_deadline_featured_engagement_boost_beat_tiebreak(self):
-        # boosted items are created FIRST (lower id): the id tie-break would rank them last,
-        # so seeing them first proves the score decided.
-        ev = self.make(self.a, title="Event soon", published_at=self.t, start_date=self.today + timedelta(days=1))
-        dl = self.make(self.a, title="Deadline soon", published_at=self.t, deadline=self.today + timedelta(days=1))
-        ft = self.make(self.coord, title="Featured", published_at=self.t, is_featured=True)
-        eng = self.make(self.a, title="Engaged", published_at=self.t)
-        Bookmark.objects.create(user=self.a, announcement=eng)
-        Bookmark.objects.create(user=self.b, announcement=eng)
-        plain = self.make(self.a, title="Plain", published_at=self.t)
-        past = self.make(self.a, title="Past event", published_at=self.t, start_date=self.today - timedelta(days=4),
-                         end_date=self.today - timedelta(days=3))
-        far = self.make(self.a, title="Far event", published_at=self.t, start_date=self.today + timedelta(days=25))
-        order = self.order(self.rec())
-        self.assertEqual(order[0], "Event soon")
-        for boosted in ("Event soon", "Deadline soon", "Featured", "Engaged", "Far event"):
-            self.assertLess(order.index(boosted), order.index("Plain"), boosted)
-        self.assertLess(order.index("Event soon"), order.index("Far event"))     # closer event wins
-        scores = {r["title"]: r["score"] for r in self.rec().data["results"]}
-        self.assertEqual(scores["Plain"], scores["Past event"])
-        # deterministic: same request twice gives the same order
-        self.assertEqual(self.order(self.rec()), self.order(self.rec()))
+    def test_filters(self):
+        self.login(self.carol)
+        self.assertEqual(self.search("?category=sports"), {str(self.football.pk)})
+        self.assertEqual(self.search(f"?category={self.sports.pk}"), {str(self.football.pk)})
+        self.assertEqual(self.search("?location=pokhara"), {str(self.robotics.pk)})
+        self.assertEqual(self.search("?when=past"), {str(self.past.pk)})
+        self.assertEqual(self.search("?when=upcoming"), {str(self.robotics.pk), str(self.football.pk)})
+        start_to = (timezone.now() + timedelta(days=10)).isoformat().replace("+", "%2B")
+        self.assertEqual(self.search(f"?when=upcoming&start_to={start_to}"), {str(self.robotics.pk)})
+        ordered = self.ids(self.assertOk(self.client.get(f"{BASE}search/?when=upcoming&ordering=-start")))
+        self.assertEqual(ordered, [str(self.football.pk), str(self.robotics.pk)])
 
-    def test_13_neutral_category_without_history_and_personal_interest_with_history(self):
-        s1 = self.make(self.a, title="Sports one", published_at=self.t)
-        s2 = self.make(self.a, title="Sports two", published_at=self.t - timedelta(days=30))
-        art = self.make(self.a, title="Arts newer id", category=self.arts, published_at=self.t)
-        # Carol has no bookmarks -> neutral: tie-break by id (art is newest id)
-        self.assertEqual(self.order(self.rec(self.c))[:2], ["Arts newer id", "Sports one"])
-        # Bob bookmarks sports -> sports preferred for Bob only
-        Bookmark.objects.create(user=self.b, announcement=s2)
-        self.assertEqual(self.order(self.rec(self.b))[0], "Sports one")
-        self.assertEqual(self.order(self.rec(self.c))[0], "Arts newer id")    # Carol unaffected by Bob's data
+    def test_registration_open_filter(self):
+        Announcement.objects.filter(pk=self.robotics.pk).update(registration_deadline=timezone.now() - timedelta(hours=1))
+        self.login(self.carol)
+        self.assertEqual(self.search("?registration_open=true"), {str(self.football.pk)})
 
-    def test_recommended_excludes_drafts_expired_and_scheduled(self):
-        ok = self.make(self.a, title="ok")
-        self.make(self.a, title="d", status=AnnouncementStatus.DRAFT, published_at=None)
-        self.make(self.a, title="e", expires_at=self.now - timedelta(minutes=1))
-        self.make(self.a, title="s", published_at=self.now + timedelta(days=1))
-        self.assertEqual(self.order(self.rec()), ["ok"])
+    def test_status_filter_does_not_leak_others_drafts(self):
+        self.login(self.carol)
+        self.assertEqual(set(self.ids(self.assertOk(self.client.get(f"{BASE}?status=draft")))), {str(self.robotics.pk), str(self.football.pk), str(self.past.pk)})
+        self.login(self.admin)
+        self.assertEqual(set(self.ids(self.assertOk(self.client.get(f"{BASE}?status=draft")))), {str(self.draft.pk)})
 
-    def test_landing_page_sections(self):
-        f = self.make(self.coord, title="Feat", is_featured=True, start_date=self.today + timedelta(days=2),
-                      deadline=self.today + timedelta(days=1), is_important=True)
-        r = self.as_user(self.b).get(reverse("announcement-landing") + "?limit=3")
-        self.assertEqual(r.status_code, 200)
-        for key in ("featured", "latest", "recommended", "upcoming_events", "upcoming_deadlines", "important"):
-            self.assertEqual([x["id"] for x in r.data[key]], [f.id], key)
-        item = r.data["featured"][0]
-        for key in ("id", "title", "short_description", "category", "author", "image_url", "published_at",
-                    "event_date", "deadline"):
-            self.assertIn(key, item)
-        self.assertEqual(self.as_user(self.b).get(reverse("announcement-landing") + "?limit=99").status_code, 400)
+    def test_invalid_filter_rejected(self):
+        self.login(self.carol)
+        self.assertError(self.client.get(f"{BASE}search/?when=tomorrow"), 400)
+
+    def test_list_query_count_is_constant(self):
+        for i in range(5):
+            self.make(self.carol, title=f"Extra {i}")
+        self.login(self.bob)
+        with self.assertNumQueries(5):  # JWT user + block ids (2) + count + page, whatever the page size
+            self.client.get(f"{BASE}search/")
 
 
-# ================================================================ bookmarks / share
-class BookmarkTests(Base):
-    def test_17_bookmark_lifecycle(self):
-        ann = self.make(self.a)
-        b = self.as_user(self.b)
-        url = reverse("announcement-bookmark", args=[ann.id])
-        self.assertEqual(b.get(url).data, {"bookmarked": False})
-        r = b.post(url)
-        self.assertEqual((r.status_code, r.data["bookmarked"], r.data["bookmark_count"]), (201, True, 1))
-        self.assertEqual(b.get(url).data, {"bookmarked": True})
-        self.assertEqual(self.ids(b.get(reverse("announcement-bookmarks"))), [ann.id])
-        self.assertTrue(b.get(reverse("announcement-detail", args=[ann.id])).data["is_bookmarked"])
-        self.assertEqual(b.delete(url).status_code, 204)
-        self.assertEqual(b.delete(url).status_code, 204)          # idempotent
-        self.assertEqual(self.ids(b.get(reverse("announcement-bookmarks"))), [])
-        self.assertEqual(b.delete(reverse("announcement-bookmark", args=[999999])).status_code, 404)
-        own = self.as_user(self.a).post(url)                       # bookmarking your own is allowed
-        self.assertEqual(own.status_code, 201)
+class BookmarkTests(AnnouncementTestCase):
+    def test_bookmark_flow_and_duplicates(self):
+        announcement = self.make()
+        self.login(self.bob)
+        self.assertOk(self.client.post(self.url(announcement, "bookmark")), 201)
+        self.assertOk(self.client.post(self.url(announcement, "bookmark")), 200)
+        self.assertEqual(AnnouncementBookmark.objects.count(), 1)
+        self.assertTrue(self.assertOk(self.client.get(self.url(announcement)))["announcement"]["is_bookmarked"])
+        listing = self.assertOk(self.client.get(f"{BASE}bookmarks/"))
+        self.assertEqual(listing["results"][0]["announcement"]["id"], str(announcement.pk))
+        self.assertOk(self.client.delete(self.url(announcement, "bookmark")))
+        self.assertOk(self.client.delete(self.url(announcement, "bookmark")))
+        self.assertEqual(AnnouncementBookmark.objects.count(), 0)
 
-    def test_18_duplicate_bookmarks_prevented(self):
-        ann = self.make(self.a)
-        b = self.as_user(self.b)
-        url = reverse("announcement-bookmark", args=[ann.id])
-        self.assertEqual(b.post(url).status_code, 201)
-        self.assertEqual(b.post(url).status_code, 200)
-        self.assertEqual(Bookmark.objects.filter(user=self.b, announcement=ann).count(), 1)
-        with self.assertRaises(IntegrityError), transaction.atomic():
-            Bookmark.objects.create(user=self.b, announcement=ann)       # database-level constraint
+    def test_visitor_cannot_bookmark(self):
+        self.assertError(self.client.post(self.url(self.make(), "bookmark")), 401)
 
-    def test_19_cannot_see_other_students_bookmarks(self):
-        ann, other = self.make(self.a), self.make(self.a, title="Second")
-        self.as_user(self.b).post(reverse("announcement-bookmark", args=[ann.id]))
-        self.as_user(self.c).post(reverse("announcement-bookmark", args=[other.id]))
-        self.assertEqual(self.ids(self.as_user(self.b).get(reverse("announcement-bookmarks"))), [ann.id])
-        self.assertEqual(self.ids(self.as_user(self.c).get(reverse("announcement-bookmarks"))), [other.id])
-        self.assertEqual(self.ids(self.as_user(self.a).get(reverse("announcement-bookmarks"))), [])
+    def test_users_only_see_their_own_bookmarks(self):
+        announcement = self.make()
+        AnnouncementBookmark.objects.create(user=self.bob, announcement=announcement)
+        self.login(self.carol)
+        self.assertEqual(self.assertOk(self.client.get(f"{BASE}bookmarks/"))["results"], [])
 
-    def test_bookmarks_listed_most_recent_first_and_hide_unpublished(self):
-        x, y = self.make(self.a, title="X"), self.make(self.a, title="Y")
-        b = self.as_user(self.b)
-        b.post(reverse("announcement-bookmark", args=[x.id]))
-        b.post(reverse("announcement-bookmark", args=[y.id]))
-        self.assertEqual(self.ids(b.get(reverse("announcement-bookmarks"))), [y.id, x.id])
-        Announcement.objects.filter(pk=y.pk).update(status=AnnouncementStatus.DRAFT)
-        self.assertEqual(self.ids(b.get(reverse("announcement-bookmarks"))), [x.id])
+    def test_cannot_bookmark_inaccessible(self):
+        self.login(self.bob)
+        self.assertError(self.client.post(self.url(self.make(visibility="private"), "bookmark")), 404)
+        self.assertError(self.client.post(self.url(self.make(status="draft"), "bookmark")), 404)
 
-    def test_share(self):
-        ann = self.make(self.a)
-        r = self.as_user(self.b).get(reverse("announcement-share", args=[ann.id]))
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.data["id"], ann.id)
-        self.assertIn(f"/announcements/{ann.id}/", r.data["detail_url"])
-        shared = self.as_user(self.c).get(reverse("announcement-shared", args=[ann.share_id]))
-        self.assertEqual((shared.status_code, shared.data["id"]), (200, ann.id))
-        self.assertEqual(APIClient().get(reverse("announcement-shared", args=[ann.share_id])).status_code, 401)
-        draft = self.make(self.a, status=AnnouncementStatus.DRAFT, published_at=None)
-        self.assertEqual(self.as_user(self.b).get(reverse("announcement-shared", args=[draft.share_id])).status_code, 404)
-        self.assertEqual(self.as_user(self.a).get(reverse("announcement-share", args=[draft.id])).status_code, 400)
+    def test_bookmark_hides_content_when_announcement_becomes_inaccessible(self):
+        announcement = self.make()
+        AnnouncementBookmark.objects.create(user=self.bob, announcement=announcement)
+        announcement.visibility = "private"
+        announcement.save()
+        self.login(self.bob)
+        item = self.assertOk(self.client.get(f"{BASE}bookmarks/"))["results"][0]
+        self.assertFalse(item["available"])
+        self.assertIsNone(item["announcement"])
+        self.assertNotIn("Hackathon", str(item))
 
 
-# ================================================================ validation / files / curation
-class ValidationTests(Base):
-    def post(self, user=None, **over):
-        fmt = over.pop("_format", "json")
-        return self.as_user(user or self.a).post(reverse("announcement-list"), self.payload(**over), format=fmt)
+class ReportTests(AnnouncementTestCase):
+    def test_report_and_duplicate(self):
+        announcement = self.make()
+        self.login(self.bob)
+        receipt = self.assertOk(self.client.post(self.url(announcement, "report"), {"reason": "spam", "description": "Ads"}, format="json"), 201)
+        self.assertEqual(receipt["report"]["status"], "pending")
+        self.assertError(self.client.post(self.url(announcement, "report"), {"reason": "spam"}, format="json"), 409, "already_reported")
 
-    def test_21_invalid_data_rejected(self):
-        today = timezone.localdate()
-        cases = {
-            "missing title": {"title": ""},
-            "short title": {"title": "ab"},
-            "missing description": {"full_description": ""},
-            "unknown category": {"category": 99999},
-            "bad status": {"status": "archived"},
-            "bad activity type": {"activity_type": "teleport"},
-            "end before start": {"start_date": (today + timedelta(days=5)).isoformat(), "end_date": (today + timedelta(days=2)).isoformat()},
-            "end without start": {"end_date": (today + timedelta(days=2)).isoformat()},
-            "event in the past": {"start_date": (today - timedelta(days=1)).isoformat()},
-            "deadline in the past": {"deadline": (today - timedelta(days=1)).isoformat()},
-            "bad date format": {"start_date": "31/12/2030"},
-            "publish_at needs published": {"status": "draft", "publish_at": (timezone.now() + timedelta(days=1)).isoformat()},
-            "publish_at past": {"publish_at": (timezone.now() - timedelta(days=1)).isoformat()},
-            "expires in past": {"expires_at": (timezone.now() - timedelta(days=1)).isoformat()},
-        }
-        for label, over in cases.items():
-            r = self.post(**over)
-            self.assertEqual(r.status_code, 400, f"{label}: {r.data}")
-        self.assertEqual(Announcement.objects.count(), 0)
+    def test_cannot_report_own_or_as_visitor(self):
+        announcement = self.make()
+        self.assertError(self.client.post(self.url(announcement, "report"), {"reason": "spam"}, format="json"), 401)
+        self.login(self.alice)
+        self.assertError(self.client.post(self.url(announcement, "report"), {"reason": "spam"}, format="json"), 400, "cannot_report_own_content")
 
-    def test_inactive_category_rejected(self):
-        Category.objects.filter(pk=self.arts.pk).update(is_active=False)
-        self.assertEqual(self.post(category=self.arts.id).status_code, 400)
-        self.assertEqual(len(self.as_user(self.a).get(reverse("announcement-categories")).data), 11)
+    def test_moderation_api_restricted(self):
+        announcement = self.make()
+        report = AnnouncementReport.objects.create(reporter=self.bob, announcement=announcement, reason="fraudulent")
+        self.assertError(self.client.get(f"{BASE}reports/"), 401)
+        self.login(self.carol)
+        self.assertError(self.client.get(f"{BASE}reports/"), 403)
+        self.assertError(self.client.patch(f"{BASE}reports/{report.pk}/", {"status": "resolved"}, format="json"), 403)
 
-    def test_category_names_unique_case_insensitively(self):
-        with self.assertRaises(IntegrityError), transaction.atomic():
-            Category.objects.create(name="sports")
-        call_command("seed_announcement_categories", stdout=io.StringIO())
-        self.assertEqual(Category.objects.count(), 12)
+    def test_moderator_resolves_and_archives(self):
+        announcement = self.make()
+        report = AnnouncementReport.objects.create(reporter=self.bob, announcement=announcement, reason="fraudulent")
+        self.login(self.coordinator)
+        self.assertEqual(self.ids(self.assertOk(self.client.get(f"{BASE}reports/?status=pending"))), [str(report.pk)])
+        data = self.assertOk(self.client.patch(
+            f"{BASE}reports/{report.pk}/", {"status": "resolved", "review_comments": "Scam", "action": "archived"}, format="json"
+        ))["report"]
+        self.assertEqual((data["status"], data["action_taken"], data["reviewed_by"]["username"]), ("resolved", "archived", "coord1"))
+        announcement.refresh_from_db()
+        self.assertEqual(announcement.status, "archived")
+        self.assertError(self.client.patch(f"{BASE}reports/{report.pk}/", {"status": "pending"}, format="json"), 400, "invalid_status_transition")
+        # after resolution the same user may report again
+        announcement.status = "published"
+        announcement.save()
+        self.login(self.bob)
+        self.assertOk(self.client.post(self.url(announcement, "report"), {"reason": "spam"}, format="json"), 201)
 
-    def test_featured_and_important_only_for_coordinators(self):
-        r = self.post(is_featured=True)
-        self.assertEqual(r.status_code, 400)
-        r = self.post(is_important=True)
-        self.assertEqual(r.status_code, 400)
-        r = self.post(user=self.coord, is_featured=True, is_important=True)
-        self.assertEqual(r.status_code, 201)
-        self.assertTrue(r.data["is_featured"] and r.data["is_important"])
-        r = self.post(is_featured=False)                      # harmless false value is accepted
-        self.assertEqual(r.status_code, 201)
-        self.assertFalse(r.data["is_featured"])
 
-    def test_image_upload_and_validation(self):
-        r = self.post(_format="multipart", image=png_file())
-        self.assertEqual(r.status_code, 201, r.data)
-        self.assertTrue(r.data["image_url"].endswith(".png"))
-        self.assertEqual(self.post(_format="multipart", image=SimpleUploadedFile("evil.png", b"not an image", content_type="image/png")).status_code, 400)
-        self.assertEqual(self.post(_format="multipart", image=SimpleUploadedFile("evil.exe", b"MZ", content_type="application/octet-stream")).status_code, 400)
-        self.assertEqual(self.post(_format="multipart", image=SimpleUploadedFile("empty.png", b"", content_type="image/png")).status_code, 400)
-        with override_settings(ANNOUNCEMENT_MAX_IMAGE_SIZE=50):
-            self.assertEqual(self.post(_format="multipart", image=png_file()).status_code, 400)
+class CategoryApiTests(AnnouncementTestCase):
+    def test_public_list_has_seeded_active_categories(self):
+        names = {c["name"] for c in self.assertOk(self.client.get("/api/categories/"))["results"]}
+        self.assertIn("Workshops and Training", names)
+        self.assertEqual(len(names), 14)
 
-    def test_image_replace_and_remove_delete_old_file(self):
-        client = self.as_user(self.a)
-        r = client.post(reverse("announcement-list"), self.payload(image=png_file("one.png")), format="multipart")
-        ann = Announcement.objects.get(pk=r.data["id"])
-        storage, old = ann.image.storage, ann.image.name
-        self.assertTrue(storage.exists(old))
+    def test_only_admin_manages_categories(self):
+        self.login(self.alice)
+        self.assertError(self.client.post("/api/categories/", {"name": "Debate"}, format="json"), 403)
+        self.login(self.admin)
+        created = self.assertOk(self.client.post("/api/categories/", {"name": "Debate"}, format="json"), 201)["category"]
+        self.assertEqual(created["slug"], "debate")
+        body = self.assertError(self.client.post("/api/categories/", {"name": "debate"}, format="json"), 400)
+        self.assertIn("name", body["errors"])
+
+    def test_category_in_use_is_deactivated_not_deleted(self):
+        self.make()
+        self.login(self.admin)
+        self.assertEqual(self.assertOk(self.client.delete(f"/api/categories/{self.tech.pk}/"))["result"], "deactivated")
+        self.tech.refresh_from_db()
+        self.assertFalse(self.tech.is_active)
+        self.assertNotIn("technology", [c["slug"] for c in self.assertOk(self.client.get("/api/categories/"))["results"]])
+        unused = Category.objects.create(name="Unused", slug="unused")
+        self.assertEqual(self.assertOk(self.client.delete(f"/api/categories/{unused.pk}/"))["result"], "deleted")
+
+
+class AnnouncementNotificationTests(AnnouncementTestCase):
+    def test_publication_notifies_friends_once(self):
+        self.befriend(self.alice, self.bob)
+        self.login(self.alice)
         with self.captureOnCommitCallbacks(execute=True):
-            r = client.patch(reverse("announcement-detail", args=[ann.id]), {"image": png_file("two.png")}, format="multipart")
-        self.assertEqual(r.status_code, 200, r.data)
-        ann.refresh_from_db()
-        self.assertNotEqual(ann.image.name, old)
-        self.assertFalse(storage.exists(old))
-        new = ann.image.name
+            announcement_id = self.assertOk(self.client.post(BASE, self.payload(status="published"), format="json"), 201)["announcement"]["id"]
+        notes = Notification.objects.filter(notification_type="announcement.published")
+        self.assertEqual([n.recipient for n in notes], [self.bob])
+        self.assertEqual(notes[0].target_id, announcement_id)
+        url = f"{BASE}{announcement_id}/"
         with self.captureOnCommitCallbacks(execute=True):
-            r = client.patch(reverse("announcement-detail", args=[ann.id]), {"remove_image": "true"}, format="multipart")
-        self.assertIsNone(r.data["image_url"])
-        self.assertFalse(storage.exists(new))
+            self.client.post(url + "archive/")
+            self.client.post(url + "restore/")
+            self.client.post(url + "publish/")
+        self.assertEqual(Notification.objects.filter(notification_type="announcement.published").count(), 1)
+        self.assertFalse(Notification.objects.filter(recipient=self.carol).exists())
 
-    def test_private_attachment_access_control(self):
-        r = self.as_user(self.a).post(reverse("announcement-list"),
-                                      self.payload(attachment=pdf_file("../../etc/rules.pdf")), format="multipart")
-        self.assertEqual(r.status_code, 201, r.data)
-        att = r.data["attachment"]
-        self.assertEqual(att["name"], "rules.pdf")
-        ann = Announcement.objects.get(pk=r.data["id"])
-        self.assertNotIn("rules", ann.attachment.name)                 # storage name is random
-        with self.assertRaises(ValueError):
-            ann.attachment.url                                        # no public URL exists
-        url = reverse("announcement-attachment", args=[ann.id])
-        got = self.as_user(self.b).get(url)
-        self.assertEqual(got.status_code, 200)
-        self.assertTrue(b"".join(got.streaming_content).startswith(b"%PDF"))
-        self.assertEqual(APIClient().get(url).status_code, 401)
-        Announcement.objects.filter(pk=ann.pk).update(status=AnnouncementStatus.DRAFT)
-        self.assertEqual(self.as_user(self.b).get(url).status_code, 404)           # draft => private
-        self.assertEqual(self.as_user(self.a).get(url).status_code, 200)           # owner still can
-        self.assertEqual(self.post(_format="multipart", attachment=SimpleUploadedFile("x.pdf", b"nope", content_type="application/pdf")).status_code, 400)
-
-    def test_deleting_announcement_removes_files(self):
-        r = self.as_user(self.a).post(reverse("announcement-list"),
-                                      self.payload(image=png_file(), attachment=pdf_file()), format="multipart")
-        ann = Announcement.objects.get(pk=r.data["id"])
-        files = [(ann.image.storage, ann.image.name), (ann.attachment.storage, ann.attachment.name)]
+    def test_private_publication_notifies_nobody(self):
+        self.befriend(self.alice, self.bob)
+        self.login(self.alice)
         with self.captureOnCommitCallbacks(execute=True):
-            self.assertEqual(self.as_user(self.a).delete(reverse("announcement-detail", args=[ann.id])).status_code, 204)
-        for storage, name in files:
-            self.assertFalse(storage.exists(name))
+            self.client.post(BASE, self.payload(status="published", visibility="private"), format="json")
+        self.assertFalse(Notification.objects.filter(notification_type="announcement.published").exists())
 
-    def test_no_n_plus_one_in_list(self):
-        for i in range(10):
-            self.make(self.a if i % 2 else self.b, title=f"N{i}")
-        client = self.as_user(self.c)
-        url = reverse("announcement-list")
-        client.get(url)
-        with self.assertNumQueries(2):    # one COUNT + one page query (category/author joined, bookmarks annotated)
-            r = client.get(url)
-        self.assertEqual(len(r.data["results"]), 10)
+    def test_draft_creation_confirms_to_author(self):
+        self.login(self.alice)
+        with self.captureOnCommitCallbacks(execute=True):
+            self.client.post(BASE, self.payload(), format="json")
+        self.assertEqual(Notification.objects.get().notification_type, "announcement.created")
+
+    def test_meaningful_update_notifies_bookmarkers_only(self):
+        announcement = self.make()
+        AnnouncementBookmark.objects.create(user=self.bob, announcement=announcement)
+        self.login(self.alice)
+        with self.captureOnCommitCallbacks(execute=True):
+            self.client.patch(self.url(announcement), {"description": "Typos fixed"}, format="json")
+        self.assertFalse(Notification.objects.filter(notification_type="announcement.updated").exists())
+        with self.captureOnCommitCallbacks(execute=True):
+            self.client.patch(self.url(announcement), {"location": "Hall B"}, format="json")
+            self.client.patch(self.url(announcement), {"start_datetime": future(6).isoformat()}, format="json")
+        note = Notification.objects.get(notification_type="announcement.updated")  # grouped while unread
+        self.assertEqual(note.recipient, self.bob)
+        self.assertEqual(note.metadata["count"], 2)
+        self.assertIn("start time", note.message)
+
+    def test_reminders_are_idempotent(self):
+        soon = self.make(start=timezone.now() + timedelta(hours=5))
+        later = self.make(start=future(10))
+        AnnouncementBookmark.objects.create(user=self.bob, announcement=soon)
+        AnnouncementBookmark.objects.create(user=self.bob, announcement=later)
+        with self.captureOnCommitCallbacks(execute=True):
+            services.send_due_reminders()
+            services.send_due_reminders()
+        reminders = Notification.objects.filter(notification_type="announcement.reminder")
+        self.assertEqual(reminders.count(), 1)
+        self.assertEqual(reminders[0].target_id, str(soon.pk))
+
+    def test_reminder_command_runs(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        out = StringIO()
+        with mock.patch("announcements.services.send_due_reminders", return_value=3) as run:
+            call_command("send_announcement_reminders", stdout=out)
+        run.assert_called_once()
+        self.assertIn("3 reminder", out.getvalue())

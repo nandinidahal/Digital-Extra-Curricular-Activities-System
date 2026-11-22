@@ -2,27 +2,24 @@ from django.urls import path
 
 from . import views
 
-# Intended mount point (NOT done yet - see API_DOCUMENTATION.md):
-#     path("api/", include("announcements.urls"))
-# Static routes come before <int:pk> for readability (an int converter never matches them anyway).
+app_name = "announcements"
+
 urlpatterns = [
-    path("announcements/", views.AnnouncementListCreateView.as_view(), name="announcement-list"),
-    path("announcements/landing/", views.LandingView.as_view(), name="announcement-landing"),
-    path("announcements/latest/", views.LatestAnnouncementsView.as_view(), name="announcement-latest"),
-    path("announcements/featured/", views.FeaturedAnnouncementsView.as_view(), name="announcement-featured"),
-    path("announcements/recommended/", views.RecommendedAnnouncementsView.as_view(), name="announcement-recommended"),
-    path("announcements/upcoming/", views.UpcomingEventsView.as_view(), name="announcement-upcoming"),
-    path("announcements/deadlines/", views.UpcomingDeadlinesView.as_view(), name="announcement-deadlines"),
-    path("announcements/important/", views.ImportantAnnouncementsView.as_view(), name="announcement-important"),
-    path("announcements/search/", views.SearchAnnouncementsView.as_view(), name="announcement-search"),
-    path("announcements/categories/", views.CategoryListView.as_view(), name="announcement-categories"),
-    path("announcements/my-announcements/", views.MyAnnouncementsView.as_view(), name="announcement-mine"),
-    path("announcements/drafts/", views.MyDraftsView.as_view(), name="announcement-drafts"),
-    path("announcements/bookmarks/", views.BookmarkedAnnouncementsView.as_view(), name="announcement-bookmarks"),
-    path("announcements/authors/<int:user_id>/", views.AuthorAnnouncementsView.as_view(), name="announcement-by-author"),
-    path("announcements/shared/<uuid:share_id>/", views.SharedAnnouncementView.as_view(), name="announcement-shared"),
-    path("announcements/<int:pk>/", views.AnnouncementDetailView.as_view(), name="announcement-detail"),
-    path("announcements/<int:pk>/bookmark/", views.BookmarkView.as_view(), name="announcement-bookmark"),
-    path("announcements/<int:pk>/share/", views.ShareInfoView.as_view(), name="announcement-share"),
-    path("announcements/<int:pk>/attachment/", views.AttachmentDownloadView.as_view(), name="announcement-attachment"),
+    path("", views.AnnouncementListCreateView.as_view(), name="list"),
+    path("public/", views.PublicAnnouncementListView.as_view(), name="public"),
+    path("search/", views.AnnouncementSearchView.as_view(), name="search"),
+    path("me/", views.MyAnnouncementsView.as_view(), name="me"),
+    path("me/drafts/", views.MyAnnouncementsView.as_view(status_filter="draft"), name="me-drafts"),
+    path("me/published/", views.MyAnnouncementsView.as_view(status_filter="published"), name="me-published"),
+    path("me/archived/", views.MyAnnouncementsView.as_view(status_filter="archived"), name="me-archived"),
+    path("bookmarks/", views.BookmarkListView.as_view(), name="bookmarks"),
+    path("reports/", views.ReportListView.as_view(), name="reports"),
+    path("reports/<uuid:report_id>/", views.ReportDetailView.as_view(), name="report-detail"),
+    path("slug/<slug:slug>/", views.AnnouncementBySlugView.as_view(), name="by-slug"),
+    path("<uuid:announcement_id>/", views.AnnouncementDetailView.as_view(), name="detail"),
+    path("<uuid:announcement_id>/publish/", views.PublishView.as_view(), name="publish"),
+    path("<uuid:announcement_id>/archive/", views.ArchiveView.as_view(), name="archive"),
+    path("<uuid:announcement_id>/restore/", views.RestoreView.as_view(), name="restore"),
+    path("<uuid:announcement_id>/bookmark/", views.BookmarkView.as_view(), name="bookmark"),
+    path("<uuid:announcement_id>/report/", views.ReportCreateView.as_view(), name="report"),
 ]

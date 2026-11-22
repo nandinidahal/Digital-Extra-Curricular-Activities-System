@@ -1,8 +1,13 @@
+.env
+*.pyc
+__pycache__/
+db.sqlite3
 venv/
 .venv/
-__pycache__/
-*.pyc
-.env
+staticfiles/
+.idea/
+.vscode/
 media/
+
+# Messaging private attachments
 private_media/
-*.sqlite3

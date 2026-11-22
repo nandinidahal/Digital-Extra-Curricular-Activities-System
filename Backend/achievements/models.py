@@ -1,133 +1,214 @@
-import mimetypes
-import os
-import uuid
+"""
+Achievements data model.
 
+Relationships
+* Achievement.user                 -> AUTH_USER_MODEL (CASCADE)
+* Achievement.category             -> AchievementCategory (PROTECT; deactivate instead of delete)
+* Achievement.related_announcement -> announcements.Announcement (SET_NULL, optional)
+* Achievement.verified_by          -> AUTH_USER_MODEL (SET_NULL)
+* AchievementEvidence              -> Achievement (CASCADE); file in PRIVATE storage
+* AchievementReview                -> Achievement (CASCADE); append-only verification history
+* social.Post.shared_achievement points here with SET_NULL.
+
+Uploading a certificate does NOT verify anything: only a reviewer's decision does.
+"""
 from django.conf import settings
 from django.db import models
 from django.db.models import Q
-from django.utils.text import slugify
+from django.db.models.functions import Lower
 
-from .storage import get_private_storage
-from .validators import ALLOWED_EXTENSIONS, safe_original_name, validate_achievement_file
+from common.files import build_storage_name, private_storage
+from common.models import BaseModel, UUIDPrimaryKeyModel
+
+TITLE_MAX_LENGTH = 200
+DESCRIPTION_MAX_LENGTH = 5000
+COMMENT_MAX_LENGTH = 2000
 
 
-class AchievementCategory(models.Model):
-    """Admin-managed categories: add new ones in the admin, no code change required."""
+def evidence_upload_to(instance, filename):
+    """achievements/<achievement uuid>/evidence/<random>.<detected ext> in PRIVATE storage."""
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "bin"
+    if ext not in {"jpg", "png", "webp", "pdf"}:
+        ext = "bin"
+    return build_storage_name("achievements", instance.achievement_id, "evidence", extension=ext)
 
-    name = models.CharField(max_length=80, unique=True)
-    slug = models.SlugField(max_length=90, unique=True, blank=True)
-    description = models.CharField(max_length=255, blank=True)
+
+class AchievementCategory(BaseModel):
+    name = models.CharField(max_length=80)
+    slug = models.SlugField(max_length=90, unique=True)
+    description = models.CharField(max_length=500, blank=True)
     is_active = models.BooleanField(default=True)
-    display_order = models.PositiveSmallIntegerField(default=500)
-    created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        ordering = ["display_order", "name"]
+        ordering = ["name"]
         verbose_name_plural = "achievement categories"
-
-    def save(self, *args, **kwargs):
-        if not self.slug:
-            base = slugify(self.name) or "category"
-            slug, n = base, 2
-            while AchievementCategory.objects.filter(slug=slug).exclude(pk=self.pk).exists():
-                slug, n = f"{base}-{n}", n + 1
-            self.slug = slug
-        super().save(*args, **kwargs)
+        constraints = [
+            models.UniqueConstraint(Lower("name"), name="achievements_category_name_ci_unique"),
+        ]
 
     def __str__(self):
         return self.name
 
 
-class Visibility(models.TextChoices):
-    PUBLIC = "public", "Public"
-    PRIVATE = "private", "Private"
+class Achievement(BaseModel):
+    class AchievementType(models.TextChoices):
+        AWARD = "award", "Award"
+        CERTIFICATE = "certificate", "Certificate"
+        COMPETITION = "competition", "Competition result"
+        PARTICIPATION = "participation", "Participation"
+        PROJECT = "project", "Project"
+        PUBLICATION = "publication", "Publication"
+        SCHOLARSHIP = "scholarship", "Scholarship"
+        VOLUNTEERING = "volunteering", "Volunteering"
+        LEADERSHIP = "leadership", "Leadership role"
+        OTHER = "other", "Other"
 
+    class Level(models.TextChoices):
+        INSTITUTIONAL = "institutional", "Institutional"
+        LOCAL = "local", "Local"
+        NATIONAL = "national", "National"
+        INTERNATIONAL = "international", "International"
+        OTHER = "other", "Other"
 
-class Achievement(models.Model):
+    class VerificationStatus(models.TextChoices):
+        PENDING = "pending", "Pending"
+        VERIFIED = "verified", "Verified"
+        REJECTED = "rejected", "Rejected"
+        MORE_INFORMATION_REQUIRED = "more_information_required", "More information required"
+
+    class Visibility(models.TextChoices):
+        PUBLIC = "public", "Public"
+        MEMBERS_ONLY = "members_only", "Members only"
+        PRIVATE = "private", "Private"
+
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="achievements")
-    category = models.ForeignKey(AchievementCategory, on_delete=models.PROTECT, related_name="achievements")
-    title = models.CharField(max_length=200)
-    description = models.TextField(blank=True)
-    issuing_organization = models.CharField(max_length=200)
+    title = models.CharField(max_length=TITLE_MAX_LENGTH)
+    description = models.TextField(max_length=DESCRIPTION_MAX_LENGTH, blank=True)
+    category = models.ForeignKey(
+        AchievementCategory, null=True, blank=True, on_delete=models.PROTECT, related_name="achievements"
+    )
+    achievement_type = models.CharField(max_length=20, choices=AchievementType.choices, default=AchievementType.OTHER)
+    organization = models.CharField(max_length=200, blank=True)
+    event_name = models.CharField(max_length=200, blank=True)
+    related_announcement = models.ForeignKey(
+        "announcements.Announcement", null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="achievements",
+    )
     achievement_date = models.DateField()
-    certificate_number = models.CharField(max_length=100, blank=True)
-    location = models.CharField(max_length=200, blank=True)
-    # Private by default: nothing becomes public unless the owner chooses it.
-    visibility = models.CharField(max_length=10, choices=Visibility.choices, default=Visibility.PRIVATE)
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
+    location = models.CharField(max_length=255, blank=True)
+    level = models.CharField(max_length=20, choices=Level.choices, default=Level.INSTITUTIONAL)
+    position = models.CharField(max_length=100, blank=True)  # e.g. "1st place", "Finalist"
+    # Same design as Profile.skills: a JSON list of short strings (validated), no extra tables.
+    skills = models.JSONField(default=list, blank=True)
+    visibility = models.CharField(max_length=20, choices=Visibility.choices, default=Visibility.PUBLIC)
+
+    verification_status = models.CharField(
+        max_length=30, choices=VerificationStatus.choices, default=VerificationStatus.PENDING
+    )
+    submitted_at = models.DateTimeField()
+    verified_at = models.DateTimeField(null=True, blank=True)
+    verified_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="achievements_verified",
+    )
+    rejection_reason = models.TextField(max_length=COMMENT_MAX_LENGTH, blank=True)
+    is_featured = models.BooleanField(default=False)
+    featured_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
-        ordering = ["-achievement_date", "-created_at", "-id"]
-        indexes = [
-            models.Index(fields=["user", "-achievement_date"], name="ach_user_date_idx"),
-            models.Index(fields=["user", "visibility", "-achievement_date"], name="ach_user_vis_date_idx"),
-        ]
+        ordering = ["-achievement_date", "-created_at"]
         constraints = [
             models.CheckConstraint(
-                condition=Q(visibility__in=Visibility.values), name="achievement_visibility_valid"
+                condition=Q(verification_status__in=["pending", "verified", "rejected", "more_information_required"]),
+                name="achievements_status_valid",
             ),
+            models.CheckConstraint(
+                condition=Q(visibility__in=["public", "members_only", "private"]), name="achievements_visibility_valid"
+            ),
+            models.CheckConstraint(
+                condition=Q(level__in=["institutional", "local", "national", "international", "other"]),
+                name="achievements_level_valid",
+            ),
+            # Only verified achievements can be featured.
+            models.CheckConstraint(
+                condition=Q(is_featured=False) | Q(verification_status="verified"),
+                name="achievements_featured_requires_verified",
+            ),
+            models.CheckConstraint(
+                condition=~Q(verification_status="verified") | Q(verified_at__isnull=False),
+                name="achievements_verified_has_timestamp",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["user", "verification_status", "-achievement_date"], name="ach_user_status_idx"),
+            models.Index(fields=["verification_status", "submitted_at"], name="ach_review_queue_idx"),
+            models.Index(fields=["verification_status", "visibility", "-achievement_date"], name="ach_listing_idx"),
+            models.Index(fields=["user", "is_featured"], name="ach_featured_idx"),
         ]
 
     def __str__(self):
         return self.title
 
-
-class DocumentType(models.TextChoices):
-    CERTIFICATE = "certificate", "Certificate"
-    SUPPORTING = "supporting", "Supporting document"
-
-
-def achievement_document_path(instance, filename):
-    """Random, collision-free storage name. The user's file name is never part of the path."""
-    ext = os.path.splitext(filename)[1].lower()
-    if ext not in ALLOWED_EXTENSIONS:
-        ext = ""
-    return f"achievements/{instance.achievement.user_id}/{uuid.uuid4().hex}{ext}"
+    @property
+    def is_verified(self):
+        return self.verification_status == self.VerificationStatus.VERIFIED
 
 
-class AchievementDocument(models.Model):
-    achievement = models.ForeignKey(Achievement, on_delete=models.CASCADE, related_name="documents")
-    file = models.FileField(
-        upload_to=achievement_document_path,
-        storage=get_private_storage,
-        max_length=255,
-        validators=[validate_achievement_file],
+class AchievementEvidence(UUIDPrimaryKeyModel):
+    class Kind(models.TextChoices):
+        IMAGE = "image", "Image"
+        PDF = "pdf", "PDF"
+
+    achievement = models.ForeignKey(Achievement, on_delete=models.CASCADE, related_name="evidence")
+    file = models.FileField(upload_to=evidence_upload_to, storage=private_storage, max_length=255)
+    kind = models.CharField(max_length=10, choices=Kind.choices)
+    original_name = models.CharField(max_length=150)  # sanitised, display only
+    content_type = models.CharField(max_length=100)  # from the DETECTED type
+    size = models.PositiveBigIntegerField()
+    uploaded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, on_delete=models.SET_NULL, related_name="achievement_evidence_uploaded"
     )
-    document_type = models.CharField(max_length=15, choices=DocumentType.choices, default=DocumentType.SUPPORTING)
-    document_name = models.CharField(max_length=150, blank=True)
-    original_filename = models.CharField(max_length=255, blank=True)
-    content_type = models.CharField(max_length=100, blank=True)
-    size = models.PositiveIntegerField(default=0)
-    uploaded_at = models.DateTimeField(auto_now_add=True)
+    created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        ordering = ["uploaded_at", "id"]
-        indexes = [models.Index(fields=["achievement", "uploaded_at"], name="achdoc_ach_uploaded_idx")]
-        constraints = [
-            # at most one certificate per achievement; any number of supporting documents
-            models.UniqueConstraint(
-                fields=["achievement"],
-                condition=Q(document_type="certificate"),
-                name="uniq_certificate_per_achievement",
-            ),
-        ]
-
-    def save(self, *args, **kwargs):
-        # Fill metadata for documents created outside the API (e.g. the admin).
-        if self.file and not self.original_filename:
-            ext = os.path.splitext(self.file.name)[1].lower()
-            self.original_filename = safe_original_name(self.file.name, ext)
-        if self.file and not self.document_name:
-            self.document_name = os.path.splitext(self.original_filename)[0][:150]
-        if self.file and not self.content_type:
-            self.content_type = mimetypes.guess_type(self.file.name)[0] or "application/octet-stream"
-        if self.file and not self.size:
-            try:
-                self.size = self.file.size
-            except (OSError, ValueError):
-                pass
-        super().save(*args, **kwargs)
+        ordering = ["created_at", "id"]
+        indexes = [models.Index(fields=["achievement", "created_at"], name="ach_evidence_idx")]
 
     def __str__(self):
-        return self.document_name or self.original_filename or f"Document {self.pk}"
+        return f"Evidence {self.id} of {self.achievement_id}"
+
+
+class AchievementReview(UUIDPrimaryKeyModel):
+    """Append-only verification history. Never edited or deleted through the API."""
+
+    class Decision(models.TextChoices):
+        SUBMITTED = "submitted", "Submitted"
+        RESUBMITTED = "resubmitted", "Resubmitted with more information"
+        VERIFIED = "verified", "Verified"
+        REJECTED = "rejected", "Rejected"
+        MORE_INFORMATION_REQUIRED = "more_information_required", "More information requested"
+        REVERIFICATION_REQUIRED = "reverification_required", "Changed after verification"
+
+    class ActorRole(models.TextChoices):
+        OWNER = "owner", "Owner"
+        REVIEWER = "reviewer", "Reviewer"
+        SYSTEM = "system", "System"
+
+    achievement = models.ForeignKey(Achievement, on_delete=models.CASCADE, related_name="reviews")
+    reviewer = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="achievement_reviews",
+    )
+    actor_role = models.CharField(max_length=10, choices=ActorRole.choices)
+    previous_status = models.CharField(max_length=30, blank=True)
+    new_status = models.CharField(max_length=30)
+    decision = models.CharField(max_length=30, choices=Decision.choices)
+    comments = models.TextField(max_length=COMMENT_MAX_LENGTH, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at", "id"]
+        indexes = [models.Index(fields=["achievement", "created_at"], name="ach_review_hist_idx")]
+
+    def __str__(self):
+        return f"{self.decision} on {self.achievement_id}"

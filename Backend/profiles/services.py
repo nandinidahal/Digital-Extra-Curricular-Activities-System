@@ -1,181 +1,250 @@
+"""
+Business logic for the Profiles module. Views and serializers stay thin.
+"""
 import logging
-from datetime import timedelta
+import uuid
+from io import BytesIO
 
 from django.conf import settings
-from django.contrib.auth import get_user_model
-from django.core.mail import send_mail
-from django.db import IntegrityError, transaction
-from django.utils import timezone
-from rest_framework.exceptions import Throttled, ValidationError
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.core.files.base import ContentFile
+from django.db import transaction
+from PIL import Image, ImageOps
+from rest_framework import serializers
 
-from accounts import services as account_services
-from accounts.services import EmailDeliveryError, generate_otp, hash_value
+from .exceptions import UploadTooLarge
+from .models import Profile
+from .validators import ALLOWED_IMAGE_FORMATS, validate_image_upload
 
-from .models import PendingEmailChange
-from .validators import ProcessedImage
+logger = logging.getLogger("profiles")
 
-User = get_user_model()
-logger = logging.getLogger(__name__)
+# Which fields count towards "profile completion" (documented in the README).
+COMPLETION_FIELDS = (
+    "profile_picture",
+    "bio",
+    "headline",
+    "institution",
+    "education_level",
+    "field_of_study",
+    "interests",
+    "skills",
+    "location",
+)
 
-GENERIC_CODE_ERROR = "Invalid or expired code."
+IMAGE_SPECS = {
+    "profile_picture": {
+        "label": "profile picture",
+        "max_bytes_setting": "PROFILE_PICTURE_MAX_BYTES",
+        "default_max_bytes": 2 * 1024 * 1024,
+        "bounding_box": (1024, 1024),
+    },
+    "cover_photo": {
+        "label": "cover photo",
+        "max_bytes_setting": "PROFILE_COVER_MAX_BYTES",
+        "default_max_bytes": 5 * 1024 * 1024,
+        "bounding_box": (2400, 1200),
+    },
+}
+# Extra room for multipart boundaries/headers when checking Content-Length early.
+MULTIPART_OVERHEAD_BYTES = 256 * 1024
 
 
-# ------------------------------------------------------------------ profile picture
-def _delete_file_on_commit(storage, name):
-    def _delete():
-        try:
-            storage.delete(name)
-        except Exception:
-            logger.exception("Could not delete profile picture %s", name)
-
-    transaction.on_commit(_delete)
-
-
-def set_profile_picture(profile, processed: ProcessedImage):
-    """Store a new picture, replacing (and later deleting) the old one."""
-    field = profile.profile_picture
-    old_name = field.name if field else None
-    storage = field.storage
-    with transaction.atomic():
-        profile.profile_picture.save(f"picture{processed.extension}", processed.content, save=False)
-        new_name = profile.profile_picture.name
-        try:
-            profile.save(update_fields=["profile_picture", "updated_at"])
-        except Exception:
-            storage.delete(new_name)  # do not leave an orphan file behind
-            raise
-        if old_name and old_name != new_name:
-            _delete_file_on_commit(storage, old_name)
+# ---------------------------------------------------------------------------
+# Creation
+# ---------------------------------------------------------------------------
+def create_profile_for_user(user):
+    """Idempotent: returns the existing profile or creates exactly one."""
+    profile, _created = Profile.objects.get_or_create(user=user)
     return profile
 
 
-def remove_profile_picture(profile):
-    """Returns True if a picture was removed."""
-    field = profile.profile_picture
-    if not field:
-        return False
-    storage, name = field.storage, field.name
-    with transaction.atomic():
-        profile.profile_picture = None
-        profile.save(update_fields=["profile_picture", "updated_at"])
-        _delete_file_on_commit(storage, name)
-    return True
+def get_or_create_profile(user):
+    """
+    Profile of `user` with the account loaded. Users created before the module
+    existed (or by a path that bypassed the signal) get their profile lazily.
+    """
+    profile = Profile.objects.select_related("user").filter(user=user).first()
+    if profile is None:
+        create_profile_for_user(user)
+        profile = Profile.objects.select_related("user").get(user=user)
+    return profile
 
 
-# ------------------------------------------------------------------ e-mail change
-def _send_email_change_code(user, new_email, code):
-    minutes = settings.OTP_EXPIRY_SECONDS // 60
-    body = (
-        f"Hi {user.full_name or user.username},\n\n"
-        f"Use this code to confirm your new email address for Digital Extra:\n\n    {code}\n\n"
-        f"This code expires in {minutes} minutes and can be used once.\n"
-        "If you did not request this change, you can ignore this email.\n\n"
-        "Digital Extra - From Screen Time to Life Time."
-    )
+def create_missing_profiles(batch_size=500, dry_run=False):
+    """Create a profile for every user that has none. Returns how many were (or would be) created."""
+    from django.contrib.auth import get_user_model
+
+    User = get_user_model()
+    missing_ids = list(User.objects.filter(profile__isnull=True).values_list("pk", flat=True))
+    total = 0
+    batch = []
+    for pk in missing_ids:
+        batch.append(Profile(user_id=pk))
+        if len(batch) >= batch_size:
+            total += _flush(batch, dry_run)
+            batch = []
+    total += _flush(batch, dry_run)
+    return total
+
+
+def _flush(batch, dry_run):
+    if not batch:
+        return 0
+    if not dry_run:
+        Profile.objects.bulk_create(batch, ignore_conflicts=True)
+    return len(batch)
+
+
+# ---------------------------------------------------------------------------
+# Completion
+# ---------------------------------------------------------------------------
+def _is_filled(profile, field_name):
+    value = getattr(profile, field_name)
+    if field_name == "profile_picture":
+        return bool(value)
+    if isinstance(value, str):
+        return bool(value.strip())
+    return bool(value)  # lists
+
+
+def calculate_completion(profile):
+    """Computed on every call, never stored, so it can never be out of date."""
+    completed = [name for name in COMPLETION_FIELDS if _is_filled(profile, name)]
+    missing = [name for name in COMPLETION_FIELDS if name not in completed]
+    percentage = round(len(completed) * 100 / len(COMPLETION_FIELDS))
+    return {
+        "percentage": percentage,
+        "completed_fields": completed,
+        "missing_fields": missing,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Updates
+# ---------------------------------------------------------------------------
+def update_profile(profile, validated_data):
+    """Apply already-validated data (partial update)."""
+    for name, value in validated_data.items():
+        setattr(profile, name, value)
+    profile.save(update_fields=[*validated_data.keys(), "updated_at"])
+    return profile
+
+
+def update_privacy(profile, validated_data):
+    return update_profile(profile, validated_data)
+
+
+# ---------------------------------------------------------------------------
+# Images
+# ---------------------------------------------------------------------------
+def max_image_bytes(field_name):
+    spec = IMAGE_SPECS[field_name]
+    return getattr(settings, spec["max_bytes_setting"], spec["default_max_bytes"])
+
+
+def check_content_length(request, field_name):
+    """Reject absurdly large bodies before they are read from the socket."""
     try:
-        send_mail("Confirm your new Digital Extra email", body, settings.DEFAULT_FROM_EMAIL, [new_email],
-                  fail_silently=False)
-    except Exception as exc:
-        raise EmailDeliveryError() from exc
-
-
-def request_email_change(user, new_email, current_password):
-    """Validate, store a pending change and mail an OTP to the NEW address."""
-    new_email = (new_email or "").strip().lower()
-    if not user.check_password(current_password):
-        raise ValidationError({"current_password": ["Current password is incorrect."]})
-    if new_email == user.email.lower():
-        raise ValidationError({"new_email": ["This is already your email address."]})
-    if User.objects.filter(email__iexact=new_email).exclude(pk=user.pk).exists():
-        raise ValidationError({"new_email": ["An account with this email already exists."]})
-
-    now = timezone.now()
-    pending = PendingEmailChange.objects.filter(user=user).first()
-    if pending:
-        wait = settings.OTP_RESEND_COOLDOWN_SECONDS - (now - pending.created_at).total_seconds()
-        if wait > 0:
-            wait = int(wait) + 1
-            raise Throttled(wait=wait, detail=f"Please wait {wait} seconds before requesting a new code.")
-
-    code = generate_otp()
-    with transaction.atomic():  # the pending change is rolled back if the e-mail cannot be sent
-        PendingEmailChange.objects.update_or_create(
-            user=user,
-            defaults={
-                "new_email": new_email,
-                "code_hash": hash_value(code),
-                "attempts": 0,
-                "created_at": now,
-                "expires_at": now + timedelta(seconds=settings.OTP_EXPIRY_SECONDS),
-            },
+        length = int(request.META.get("CONTENT_LENGTH") or 0)
+    except (TypeError, ValueError):
+        length = 0
+    if length > max_image_bytes(field_name) + MULTIPART_OVERHEAD_BYTES:
+        raise UploadTooLarge(
+            f"The uploaded file is too large for a {IMAGE_SPECS[field_name]['label']}."
         )
-        _send_email_change_code(user, new_email, code)
-    return new_email
 
 
-def confirm_email_change(user, code):
-    """Verify the OTP and switch the account's e-mail address."""
-    import hmac
+def validate_upload(upload, field_name):
+    """Returns the detected image format, or raises a DRF validation error on `image`."""
+    try:
+        return validate_image_upload(upload, max_bytes=max_image_bytes(field_name))
+    except DjangoValidationError as exc:
+        raise serializers.ValidationError({"image": list(exc.messages)})
 
-    error = None
-    old_email = user.email
-    with transaction.atomic():
-        pending = PendingEmailChange.objects.select_for_update().filter(user=user).first()
-        if pending is None:
-            error = "There is no pending email change. Request one first."
-        elif pending.expires_at <= timezone.now():
-            pending.delete()
-            error = "This code has expired. Please request a new one."
-        elif pending.attempts >= settings.OTP_MAX_ATTEMPTS:
-            pending.delete()
-            error = "Too many incorrect attempts. Please request a new code."
-        elif not hmac.compare_digest(pending.code_hash, hash_value(code)):
-            pending.attempts += 1
-            pending.save(update_fields=["attempts"])
-            error = GENERIC_CODE_ERROR
-        elif User.objects.filter(email__iexact=pending.new_email).exclude(pk=user.pk).exists():
-            pending.delete()
-            error = "An account with this email already exists."
+
+def process_image(upload, image_format, field_name):
+    """
+    Re-encode the image. This (a) strips EXIF/GPS and any hidden payload,
+    (b) applies the camera rotation, (c) caps the dimensions and
+    (d) guarantees the stored bytes are exactly what we say they are.
+    """
+    spec = IMAGE_SPECS[field_name]
+    try:
+        upload.seek(0)
+        with Image.open(upload) as source:
+            image = ImageOps.exif_transpose(source)
+            image.load()  # decodes fully; truncated/corrupt files fail here
+        for metadata_key in ("exif", "xmp", "comment"):
+            image.info.pop(metadata_key, None)
+        if image_format == "JPEG":
+            if image.mode not in ("RGB", "L"):
+                image = image.convert("RGB")
+        elif image.mode not in ("RGB", "RGBA", "L", "LA"):
+            image = image.convert("RGBA")
+        image.thumbnail(spec["bounding_box"], Image.Resampling.LANCZOS)
+
+        buffer = BytesIO()
+        if image_format == "JPEG":
+            image.save(buffer, "JPEG", quality=85, optimize=True)
+        elif image_format == "PNG":
+            image.save(buffer, "PNG", optimize=True)
         else:
-            user.email = pending.new_email
-            try:
-                with transaction.atomic():
-                    user.save(update_fields=["email"])
-            except IntegrityError:
-                pending.delete()
-                error = "An account with this email already exists."
-            else:
-                pending.delete()
-    if error:
-        raise ValidationError({"otp": [error]})
+            image.save(buffer, "WEBP", quality=85)
+    except (OSError, ValueError, SyntaxError, EOFError, Image.DecompressionBombError):
+        raise serializers.ValidationError({"image": ["The uploaded file is not a valid image."]})
 
-    # Tell the previous address that the change happened (best effort).
+    extension = ALLOWED_IMAGE_FORMATS[image_format]
+    return ContentFile(buffer.getvalue(), name=f"{uuid.uuid4().hex}.{extension}")
+
+
+def _delete_stored_file(storage, name):
     try:
-        send_mail(
-            "Your Digital Extra email was changed",
-            f"The email address on your Digital Extra account was changed to {user.email}.\n"
-            "If this was not you, contact support immediately.",
-            settings.DEFAULT_FROM_EMAIL, [old_email], fail_silently=True,
-        )
+        storage.delete(name)
+    except Exception:  # never fail a request because cleanup failed
+        logger.warning("Could not delete old profile image %s", name, exc_info=True)
+
+
+def set_profile_image(profile, field_name, upload, image_format):
+    """
+    Store a new image and remove the previous one (after the database commit,
+    so a failed save never leaves a profile pointing at a deleted file).
+    """
+    content = process_image(upload, image_format, field_name)
+    storage = Profile._meta.get_field(field_name).storage
+    new_name = None
+    try:
+        with transaction.atomic():
+            locked = (
+                Profile.objects.select_for_update(of=("self",))
+                .select_related("user")
+                .get(pk=profile.pk)
+            )
+            field_file = getattr(locked, field_name)
+            old_name = field_file.name if field_file else None
+            field_file.save(content.name, content, save=False)
+            new_name = field_file.name
+            locked.save(update_fields=[field_name, "updated_at"])
+            if old_name:
+                transaction.on_commit(lambda: _delete_stored_file(storage, old_name))
     except Exception:
-        logger.exception("Could not notify the previous email address")
-    return user
+        if new_name:
+            _delete_stored_file(storage, new_name)
+        raise
+    return locked
 
 
-# ------------------------------------------------------------------ deactivation
-def deactivate_account(user, profile):
-    """Disable the account (never deletes data) and end every session."""
+def remove_profile_image(profile, field_name):
+    storage = Profile._meta.get_field(field_name).storage
     with transaction.atomic():
-        user.is_active = False
-        user.save(update_fields=["is_active"])
-        profile.deactivated_at = timezone.now()
-        profile.save(update_fields=["deactivated_at", "updated_at"])
-        account_services.revoke_all_sessions(user)
-
-
-def reactivate_account(user, profile):
-    with transaction.atomic():
-        user.is_active = True
-        user.save(update_fields=["is_active"])
-        profile.deactivated_at = None
-        profile.save(update_fields=["deactivated_at", "updated_at"])
+        locked = (
+            Profile.objects.select_for_update(of=("self",))
+            .select_related("user")
+            .get(pk=profile.pk)
+        )
+        field_file = getattr(locked, field_name)
+        old_name = field_file.name if field_file else None
+        if old_name:
+            setattr(locked, field_name, "")
+            locked.save(update_fields=[field_name, "updated_at"])
+            transaction.on_commit(lambda: _delete_stored_file(storage, old_name))
+    return locked
