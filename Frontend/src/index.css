@@ -1,19 +1,74 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+
+/* DEAS design tokens: one brand colour (teal), one warm accent (amber), neutral slate greys. */
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+
+  --color-brand-50: #effaf8;
+  --color-brand-100: #d6f2ed;
+  --color-brand-200: #afe4db;
+  --color-brand-300: #7dcfc3;
+  --color-brand-400: #4bb3a7;
+  --color-brand-500: #2a978c;
+  --color-brand-600: #1d7b72;
+  --color-brand-700: #0f766e;
+  --color-brand-800: #115e58;
+  --color-brand-900: #134e49;
+
+  --color-accent-400: #fbbf24;
+  --color-accent-500: #f59e0b;
+
+  --shadow-card: 0 1px 2px rgb(15 23 42 / 0.04), 0 1px 3px rgb(15 23 42 / 0.06);
+  --shadow-pop: 0 10px 30px -10px rgb(15 23 42 / 0.25);
+}
 
 @layer base {
-  html { scroll-behavior: smooth; scroll-padding-top: 5rem; }
-  body { @apply bg-paper font-sans text-ink antialiased; }
-  h1, h2, h3 { @apply font-display tracking-tight; }
-  :focus-visible { @apply outline-2 outline-offset-2 outline-pine-600; }
-  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+  body {
+    @apply bg-slate-50 text-slate-800 antialiased;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+  h1, h2, h3, h4 {
+    @apply text-slate-900 tracking-tight;
+  }
+  :focus-visible {
+    @apply outline-2 outline-offset-2 outline-brand-500;
+  }
+  button:not(:disabled), [role="button"]:not([aria-disabled="true"]) {
+    cursor: pointer;
+  }
 }
 
 @layer components {
-  .container-page { @apply mx-auto w-full max-w-6xl px-5 sm:px-8; }
-  .btn { @apply inline-flex items-center justify-center rounded-lg px-5 py-2.5 text-sm font-semibold transition-colors; }
-  .btn-primary { @apply btn bg-pine-700 text-white hover:bg-pine-800; }
-  .btn-accent { @apply btn bg-marigold-400 text-ink hover:bg-marigold-300; }
-  .btn-outline { @apply btn border border-pine-700 text-pine-700 hover:bg-pine-50; }
+  .card {
+    @apply rounded-2xl border border-slate-200/80 bg-white shadow-card;
+  }
+  .input {
+    @apply block w-full rounded-xl border border-slate-300 bg-white px-3.5 py-2.5 text-sm text-slate-900
+      placeholder:text-slate-400 transition
+      focus:border-brand-500 focus:ring-4 focus:ring-brand-100 focus:outline-none
+      disabled:cursor-not-allowed disabled:bg-slate-100;
+  }
+  .input-invalid {
+    @apply border-rose-400 focus:border-rose-500 focus:ring-rose-100;
+  }
+  .label {
+    @apply mb-1.5 block text-sm font-medium text-slate-700;
+  }
+  .chip {
+    @apply inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-medium;
+  }
+  .prose-plain {
+    @apply whitespace-pre-line break-words;
+  }
+}
+
+/* Thin scrollbars for side panels */
+.scroll-thin::-webkit-scrollbar { width: 6px; height: 6px; }
+.scroll-thin::-webkit-scrollbar-thumb { background: rgb(148 163 184 / 0.5); border-radius: 9999px; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
 }

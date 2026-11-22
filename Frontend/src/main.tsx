@@ -1,17 +1,36 @@
-import React from "react";
-import ReactDOM from "react-dom/client";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { StrictMode } from "react";
+import { createRoot } from "react-dom/client";
 import { BrowserRouter } from "react-router-dom";
+import { Toaster } from "sonner";
 import App from "./App";
-import { AuthProvider } from "./context/AuthContext";
+import { ConfirmProvider } from "./components/common/Modal";
+import { AuthProvider } from "./contexts/AuthContext";
+import { ApiError } from "./services/api/errors";
 import "./index.css";
 
-ReactDOM.createRoot(document.getElementById("root")!).render(
-  <React.StrictMode>
-    {/* BASE_URL is "/xca/" so all routes work under jking.com.np/xca */}
-    <BrowserRouter basename={import.meta.env.BASE_URL}>
-      <AuthProvider>
-        <App />
-      </AuthProvider>
-    </BrowserRouter>
-  </React.StrictMode>
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      staleTime: 30_000,
+      refetchOnWindowFocus: false,
+      // Do not retry errors the user cannot fix by waiting (404 private content, 403, 401, 400).
+      retry: (count, error) => !(error instanceof ApiError && error.status >= 400 && error.status < 500) && count < 2,
+    },
+  },
+});
+
+createRoot(document.getElementById("root")!).render(
+  <StrictMode>
+    <QueryClientProvider client={queryClient}>
+      <BrowserRouter>
+        <AuthProvider>
+          <ConfirmProvider>
+            <App />
+            <Toaster position="top-right" richColors closeButton toastOptions={{ className: "font-sans" }} />
+          </ConfirmProvider>
+        </AuthProvider>
+      </BrowserRouter>
+    </QueryClientProvider>
+  </StrictMode>,
 );
