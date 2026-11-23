@@ -1,8 +1,9 @@
-import { Megaphone } from "lucide-react";
+// import { Megaphone } from "lucide-react";
 import { Link, NavLink } from "react-router-dom";
 import { Button } from "@/components/common/Button";
 import { cn } from "@/utils/cn";
 import { Logo } from "./Logo";
+import {Footer} from "../layout/Footer"
 
 /** Navbar for logged-out visitors: brand, Announcements, Create Account, Log In. */
 export function PublicNavbar() {
@@ -16,7 +17,7 @@ export function PublicNavbar() {
             end
             className={({ isActive }) => cn("hidden items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium sm:inline-flex", isActive ? "text-brand-800" : "text-slate-600 hover:text-slate-900")}
           >
-            <Megaphone className="h-4 w-4" /> Announcements
+            {/* <Megaphone className="h-4 w-4" /> Announcements */}
           </NavLink>
         </div>
         <div className="flex items-center gap-2">
@@ -30,11 +31,12 @@ export function PublicNavbar() {
 
 export function PublicFooter() {
   return (
-    <footer className="border-t border-slate-200 bg-white">
-      <div className="mx-auto flex max-w-6xl flex-col items-center justify-between gap-3 px-6 py-6 text-sm text-slate-500 sm:flex-row">
-        <Logo compact />
-        <p>Digital Extra-Curricular Activities System · From Screen Time to Life Time</p>
-      </div>
-    </footer>
+    // <footer className="border-t border-slate-200 bg-white">
+    //   {/* <div className="mx-auto flex max-w-6xl flex-col items-center justify-between gap-3 px-6 py-6 text-sm text-slate-500 sm:flex-row">
+    //     <Logo compact />
+    //     <p>Digital Extra-Curricular Activities System · From Screen Time to Life Time</p>
+    //   </div> */}
+    // </footer>
+    <Footer/>
   );
 }
