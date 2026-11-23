@@ -41,16 +41,10 @@ def env_list(name, default=""):
 # --------------------------------------------------------------------------
 DEBUG = env_bool("DJANGO_DEBUG", False)
 
-SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "")
-if not SECRET_KEY:
-    raise ImproperlyConfigured(
-        "DJANGO_SECRET_KEY is not set. Copy .env.example to .env and set a "
-        "long random value."
-    )
-if not DEBUG and SECRET_KEY.startswith("change-me"):
-    raise ImproperlyConfigured("Set a real DJANGO_SECRET_KEY before running in production.")
+SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY")
 
-ALLOWED_HOSTS = env_list("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1" if DEBUG else "")
+
+ALLOWED_HOSTS = env_list("DJANGO_ALLOWED_HOSTS")
 
 INSTALLED_APPS = [
     # daphne must come before django.contrib.staticfiles so `runserver` serves
@@ -115,23 +109,15 @@ ASGI_APPLICATION = "config.asgi.application"
 # --------------------------------------------------------------------------
 # Database (PostgreSQL)
 # --------------------------------------------------------------------------
-if os.environ.get("DB_ENGINE", "postgresql").lower() == "sqlite":
-    # Only for quick local experiments. Use PostgreSQL for real work.
-    DATABASES = {
-        "default": {
-            "ENGINE": "django.db.backends.sqlite3",
-            "NAME": BASE_DIR / "db.sqlite3",
-        }
-    }
-else:
-    DATABASES = {
+
+DATABASES = {
         "default": {
             "ENGINE": "django.db.backends.postgresql",
-            "NAME": os.environ.get("DB_NAME", "deas_db"),
-            "USER": os.environ.get("DB_USER", "postgres"),
-            "PASSWORD": os.environ.get("DB_PASSWORD", ""),
-            "HOST": os.environ.get("DB_HOST", "localhost"),
-            "PORT": os.environ.get("DB_PORT", "5432"),
+            "NAME": os.environ.get("DB_NAME"),
+            "USER": os.environ.get("DB_USER"),
+            "PASSWORD": os.environ.get("DB_PASSWORD"),
+            "HOST": os.environ.get("DB_HOST", ),
+            "PORT": os.environ.get("DB_PORT", ),
         }
     }
 
@@ -455,12 +441,11 @@ else:
 # CORS (React + Vite frontend)
 # --------------------------------------------------------------------------
 CORS_ALLOWED_ORIGINS = env_list(
-    "CORS_ALLOWED_ORIGINS",
-    "http://localhost:5173,http://127.0.0.1:5173" if DEBUG else "",
+    "CORS_ALLOWED_ORIGINS"
 )
 # Tokens travel in the Authorization header, not in cookies.
 CORS_ALLOW_CREDENTIALS = False
-CSRF_TRUSTED_ORIGINS = env_list("CSRF_TRUSTED_ORIGINS", "")
+CSRF_TRUSTED_ORIGINS = env_list("CSRF_TRUSTED_ORIGINS")
 
 
 # --------------------------------------------------------------------------
